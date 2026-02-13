@@ -105,6 +105,40 @@ def create_network(
     if algo == "ia3" and preset_str != "ia3":
         logger.warning("It is recommended to use preset ia3 for IA^3 algorithm")
 
+    # regex-specific learning rates / dimensions
+    def parse_kv_pairs(kv_pair_str: str, is_int: bool) -> dict[str, float]:
+        """
+        Parse a string of key-value pairs separated by commas.
+        """
+        pairs = {}
+        for pair in kv_pair_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                logger.warning(f"Invalid format: {pair}, expected 'key=value'")
+                continue
+            key, value = pair.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            try:
+                pairs[key] = int(value) if is_int else float(value)
+            except ValueError:
+                logger.warning(f"Invalid value for {key}: {value}")
+        return pairs
+
+    network_reg_lrs = kwargs.get("network_reg_lrs", None)
+    if network_reg_lrs is not None:
+        reg_lrs = parse_kv_pairs(network_reg_lrs, is_int=False)
+    else:
+        reg_lrs = None
+
+    network_reg_dims = kwargs.get("network_reg_dims", None)
+    if network_reg_dims is not None:
+        reg_dims = parse_kv_pairs(network_reg_dims, is_int=True)
+    else:
+        reg_dims = None
+
     network = LycorisNetworkKohya(
         text_encoder,
         unet,
@@ -133,6 +167,8 @@ def create_network(
         unbalanced_factorization=unbalanced_factorization,
         train_t5xxl=train_t5xxl,
         warn_on_unmatched=warn_on_unmatched,
+        reg_dims=reg_dims,
+        reg_lrs=reg_lrs,
     )
     if (
         loraplus_lr_ratio is not None
@@ -260,6 +296,9 @@ class LycorisNetworkKohya(LycorisNetwork):
         "FinalLayer",  # lumina-image-2
         "QwenImageTransformerBlock",  # Qwen
         "ZImageTransformerBlock",
+        "Block",  # Anima
+        "PatchEmbed",  # Anima
+        "TimestepEmbedding",  # Anima
     ]
     UNET_TARGET_REPLACE_NAME = [
         "conv_in",
@@ -277,6 +316,10 @@ class LycorisNetworkKohya(LycorisNetwork):
         "Gemma2FlashAttention2",
         "Gemma2SdpaAttention",
         "Gemma2MLP",
+        "Qwen3Attention",  # Anima Qwen3
+        "Qwen3MLP",  # Anima Qwen3
+        "Qwen3SdpaAttention",  # Anima Qwen3
+        "Qwen3FlashAttention2",  # Anima Qwen3
     ]
     TEXT_ENCODER_TARGET_REPLACE_NAME = []
     LORA_PREFIX_UNET = "lora_unet"
@@ -325,6 +368,8 @@ class LycorisNetworkKohya(LycorisNetwork):
         train_norm=False,
         train_t5xxl=False,
         warn_on_unmatched=True,
+        reg_dims=None,
+        reg_lrs=None,
         **kwargs,
     ) -> None:
         torch.nn.Module.__init__(self)
@@ -332,6 +377,8 @@ class LycorisNetworkKohya(LycorisNetwork):
         self.multiplier = multiplier
         self.lora_dim = lora_dim
         self.train_t5xxl = train_t5xxl
+        self.reg_dims = reg_dims
+        self.reg_lrs = reg_lrs
 
         # 初始化LoRA+相关属性
         self.loraplus_lr_ratio = None
@@ -362,6 +409,39 @@ class LycorisNetworkKohya(LycorisNetwork):
 
         self.use_tucker = use_tucker
 
+        import ast
+        self.exclude_patterns = kwargs.get("exclude_patterns", None)
+        if self.exclude_patterns is not None and isinstance(self.exclude_patterns, str):
+            try:
+                self.exclude_patterns = ast.literal_eval(self.exclude_patterns)
+            except Exception:
+                self.exclude_patterns = [self.exclude_patterns]
+        if self.exclude_patterns is not None and not isinstance(self.exclude_patterns, list):
+             self.exclude_patterns = [self.exclude_patterns]
+
+        self.include_patterns = kwargs.get("include_patterns", None)
+        if self.include_patterns is not None and isinstance(self.include_patterns, str):
+            try:
+                self.include_patterns = ast.literal_eval(self.include_patterns)
+            except Exception:
+                self.include_patterns = [self.include_patterns]
+        if self.include_patterns is not None and not isinstance(self.include_patterns, list):
+             self.include_patterns = [self.include_patterns]
+             
+        def str_to_re_patterns(patterns):
+            re_patterns = []
+            if patterns is not None:
+                for pattern in patterns:
+                    try:
+                        re_pattern = re.compile(pattern)
+                        re_patterns.append(re_pattern)
+                    except re.error as e:
+                        logger.error(f"Invalid pattern '{pattern}': {e}")
+            return re_patterns
+
+        self.exclude_re_patterns = str_to_re_patterns(self.exclude_patterns)
+        self.include_re_patterns = str_to_re_patterns(self.include_patterns)
+
         def create_single_module(
             lora_name: str,
             module: torch.nn.Module,
@@ -369,6 +449,7 @@ class LycorisNetworkKohya(LycorisNetwork):
             dim=None,
             alpha=None,
             use_tucker=self.use_tucker,
+            original_name=None,
             **kwargs,
         ):
             for k, v in root_kwargs.items():
@@ -385,6 +466,18 @@ class LycorisNetworkKohya(LycorisNetwork):
                     self.module_dropout,
                     **kwargs,
                 )
+            
+            if self.reg_dims is not None and original_name is not None:
+                for reg, d in self.reg_dims.items():
+                    if re.fullmatch(reg, original_name):
+                        dim = d
+                        alpha = self.alpha
+                        logger.info(f"Module {original_name} matched regex '{reg}' -> dim: {dim}")
+                        break
+            
+            if dim is not None and dim == 0:
+                return None
+
             lora = None
             if isinstance(module, torch.nn.Linear) and lora_dim > 0:
                 dim = dim or lora_dim
@@ -415,6 +508,8 @@ class LycorisNetworkKohya(LycorisNetwork):
                 use_tucker,
                 **kwargs,
             )
+            if lora is not None:
+                lora.original_name = original_name
             return lora
 
         def create_modules_(
@@ -422,16 +517,37 @@ class LycorisNetworkKohya(LycorisNetwork):
             root_module: torch.nn.Module,
             algo,
             configs={},
+            original_prefix=None,
         ):
             loras = {}
             lora_names = []
             for name, module in root_module.named_modules():
+                full_original_name = (original_prefix + "." + name) if original_prefix and name else (original_prefix or name)
+                
+                is_excluded = False
+                if self.exclude_re_patterns:
+                    for pattern in self.exclude_re_patterns:
+                        if pattern.fullmatch(full_original_name) or pattern.search(full_original_name):
+                             is_excluded = True
+                             break
+                
+                is_included = False
+                if self.include_re_patterns:
+                    for pattern in self.include_re_patterns:
+                         if pattern.fullmatch(full_original_name) or pattern.search(full_original_name):
+                             is_included = True
+                             break
+                             
+                if is_excluded and not is_included:
+                    continue
+
                 module_name = module.__class__.__name__
                 if module_name in self.MODULE_ALGO_MAP and module is not root_module:
                     next_config = self.MODULE_ALGO_MAP[module_name]
                     next_algo = next_config.get("algo", algo)
                     new_loras, new_lora_names = create_modules_(
-                        f"{prefix}_{name}", module, next_algo, next_config
+                        f"{prefix}_{name}", module, next_algo, next_config,
+                        original_prefix=full_original_name
                     )
                     for lora_name, lora in zip(new_lora_names, new_loras):
                         if lora_name not in loras:
@@ -446,7 +562,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                 if lora_name in loras:
                     continue
 
-                lora = create_single_module(lora_name, module, algo, **configs)
+                lora = create_single_module(lora_name, module, algo, original_name=full_original_name, **configs)
                 if lora is not None:
                     loras[lora_name] = lora
                     lora_names.append(lora_name)
@@ -466,6 +582,23 @@ class LycorisNetworkKohya(LycorisNetwork):
             matched_modules = set()
             matched_names = set()
             for name, module in root_module.named_modules():
+                is_excluded = False
+                if self.exclude_re_patterns:
+                    for pattern in self.exclude_re_patterns:
+                        if pattern.fullmatch(name) or pattern.search(name):
+                             is_excluded = True
+                             break
+                
+                is_included = False
+                if self.include_re_patterns:
+                    for pattern in self.include_re_patterns:
+                         if pattern.fullmatch(name) or pattern.search(name):
+                             is_included = True
+                             break
+                             
+                if is_excluded and not is_included:
+                    continue
+
                 module_name = module.__class__.__name__
                 if module_name in target_replace_modules and not any(
                     self.match_fn(t, name) for t in target_replace_names
@@ -477,7 +610,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                     else:
                         algo = network_module
                     loras.extend(
-                        create_modules_(f"{prefix}_{name}", module, algo, next_config)[
+                        create_modules_(f"{prefix}_{name}", module, algo, next_config, original_prefix=name)[
                             0
                         ]
                     )
@@ -503,7 +636,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                         algo = network_module
                     lora_name = prefix + "." + name
                     lora_name = lora_name.replace(".", "_")
-                    lora = create_single_module(lora_name, module, algo, **next_config)
+                    lora = create_single_module(lora_name, module, algo, original_name=name, **next_config)
                     next_config = {}
                     if lora is not None:
                         loras.append(lora)
@@ -544,10 +677,19 @@ class LycorisNetworkKohya(LycorisNetwork):
                 f"create LyCORIS for Text Encoder: {len(self.text_encoder_loras)} modules."
             )
 
+        unet_target_modules = list(LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE)
+        train_llm_adapter = kwargs.get("train_llm_adapter", False)
+        if isinstance(train_llm_adapter, str):
+            train_llm_adapter = train_llm_adapter.lower() in ("true", "1", "yes")
+        
+        if train_llm_adapter:
+            unet_target_modules.append("LLMAdapterTransformerBlock")
+            logger.info("Enable training for LLM Adapter (Anima)")
+
         self.unet_loras, unet_matched_modules, unet_matched_names = create_modules(
             LycorisNetworkKohya.LORA_PREFIX_UNET,
             unet,
-            LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE,
+            unet_target_modules,
             LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME,
         )
         logger.info(f"create LyCORIS for U-Net: {len(self.unet_loras)} modules.")
@@ -726,8 +868,30 @@ class LycorisNetworkKohya(LycorisNetwork):
 
         def assemble_params(loras, lr, ratio):
             param_groups = {"lora": {}, "plus": {}}
+            reg_groups = {}
+            reg_lrs_list = list(self.reg_lrs.items()) if self.reg_lrs is not None else []
+
             for lora in loras:
+                matched_reg_lr = None
+                if hasattr(lora, "original_name") and lora.original_name:
+                    for i, (regex_str, reg_lr) in enumerate(reg_lrs_list):
+                        if re.fullmatch(regex_str, lora.original_name):
+                            matched_reg_lr = (i, reg_lr)
+                            logger.info(f"Module {lora.original_name} matched regex '{regex_str}' -> LR {reg_lr}")
+                            break
+
                 for name, param in lora.named_parameters():
+                    if matched_reg_lr is not None:
+                        reg_idx, reg_lr = matched_reg_lr
+                        group_key = f"reg_lr_{reg_idx}"
+                        if group_key not in reg_groups:
+                            reg_groups[group_key] = {"lora": {}, "plus": {}, "lr": reg_lr}
+                        if ratio is not None and "lora_up" in name:
+                            reg_groups[group_key]["plus"][f"{lora.lora_name}.{name}"] = param
+                        else:
+                            reg_groups[group_key]["lora"][f"{lora.lora_name}.{name}"] = param
+                        continue
+
                     if ratio is not None and "lora_up" in name:
                         param_groups["plus"][f"{lora.lora_name}.{name}"] = param
                     else:
@@ -735,6 +899,25 @@ class LycorisNetworkKohya(LycorisNetwork):
 
             params = []
             descriptions = []
+
+            for group_key, group in reg_groups.items():
+                reg_lr = group["lr"]
+                for key in ("lora", "plus"):
+                    param_data = {"params": group[key].values()}
+                    if len(param_data["params"]) == 0:
+                        continue
+                    if key == "plus":
+                        param_data["lr"] = reg_lr * ratio if ratio is not None else reg_lr
+                    else:
+                        param_data["lr"] = reg_lr
+                    
+                    if param_data.get("lr", None) == 0 or param_data.get("lr", None) is None:
+                        continue
+                    
+                    params.append(param_data)
+                    desc = f"reg_lr_{group_key.split('_')[-1]}"
+                    descriptions.append(desc + (" plus" if key == "plus" else ""))
+
             for key in param_groups.keys():
                 param_data = {"params": param_groups[key].values()}
 

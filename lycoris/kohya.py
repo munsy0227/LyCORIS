@@ -299,6 +299,7 @@ class LycorisNetworkKohya(LycorisNetwork):
         "Block",  # Anima
         "PatchEmbed",  # Anima
         "TimestepEmbedding",  # Anima
+        "LLMAdapterTransformerBlock",  # Anima
     ]
     UNET_TARGET_REPLACE_NAME = [
         "conv_in",
@@ -316,10 +317,10 @@ class LycorisNetworkKohya(LycorisNetwork):
         "Gemma2FlashAttention2",
         "Gemma2SdpaAttention",
         "Gemma2MLP",
-        "Qwen3Attention",  # Anima Qwen3
-        "Qwen3MLP",  # Anima Qwen3
-        "Qwen3SdpaAttention",  # Anima Qwen3
-        "Qwen3FlashAttention2",  # Anima Qwen3
+        "Qwen3Attention",  # Anima / Qwen3
+        "Qwen3FlashAttention2",  # Anima / Qwen3
+        "Qwen3SdpaAttention",  # Anima / Qwen3
+        "Qwen3MLP",  # Anima / Qwen3
     ]
     TEXT_ENCODER_TARGET_REPLACE_NAME = []
     LORA_PREFIX_UNET = "lora_unet"

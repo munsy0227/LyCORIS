@@ -347,7 +347,7 @@ class TLoraModule(LycorisBaseModule):
         alpha: torch.Tensor,
     ):
         """Reconstruct module from saved state dict."""
-        lora_dim = q_weight.shape[0] if q_weight.dim() == 2 else q_weight.shape[0]
+        lora_dim = q_weight.shape[0]
         module = cls(
             lora_name,
             orig_module,

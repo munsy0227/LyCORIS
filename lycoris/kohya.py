@@ -299,7 +299,6 @@ class LycorisNetworkKohya(LycorisNetwork):
         "Block",  # Anima
         "PatchEmbed",  # Anima
         "TimestepEmbedding",  # Anima
-        "LLMAdapterTransformerBlock",  # Anima
     ]
     UNET_TARGET_REPLACE_NAME = [
         "conv_in",

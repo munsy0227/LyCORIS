@@ -24,7 +24,6 @@ FULL_UNET_MODULES = [
     "Block",  # Anima
     "PatchEmbed",  # Anima
     "TimestepEmbedding",  # Anima
-    "LLMAdapterTransformerBlock",  # Anima
 ]
 
 FULL_UNET_NAMES = [
@@ -80,7 +79,6 @@ BUILTIN_PRESET_CONFIGS = {
             "Block",  # Anima
             "PatchEmbed",  # Anima
             "TimestepEmbedding",  # Anima
-            "LLMAdapterTransformerBlock",  # Anima
         ],
         unet_target_name=[
             "time_embedding.linear_1",
@@ -109,7 +107,6 @@ BUILTIN_PRESET_CONFIGS = {
             "Block",  # Anima
             "PatchEmbed",  # Anima
             "TimestepEmbedding",  # Anima
-            "LLMAdapterTransformerBlock",  # Anima
         ],
         unet_target_name=[],
         text_encoder_target_module=FULL_TEXT_ENCODER_MODULES,
@@ -163,7 +160,6 @@ BUILTIN_PRESET_CONFIGS = {
             "Block",  # Anima
             "PatchEmbed",  # Anima
             "TimestepEmbedding",  # Anima
-            "LLMAdapterTransformerBlock",  # Anima
         ],
         unet_target_name=[],
         text_encoder_target_module=[],

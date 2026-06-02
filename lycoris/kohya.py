@@ -31,7 +31,7 @@ from .logging import logger
 ANIMA_DEFAULT_EXCLUDE_PATTERNS = (
     r".*(_modulation|_norm|_embedder|final_layer).*",
 )
-ANIMA_MODULE_CLASSES = {"Block", "PatchEmbed", "TimestepEmbedding", "FinalLayer"}
+ANIMA_REQUIRED_MODULE_CLASSES = {"Block", "PatchEmbed", "TimestepEmbedding"}
 
 
 def normalize_patterns(patterns):
@@ -54,8 +54,11 @@ def is_anima_unet(unet):
     if unet is None:
         return False
 
+    if unet.__class__.__name__ == "Anima":
+        return True
+
     module_classes = {module.__class__.__name__ for module in unet.modules()}
-    return ANIMA_MODULE_CLASSES.issubset(module_classes)
+    return ANIMA_REQUIRED_MODULE_CLASSES.issubset(module_classes)
 
 
 def compile_patterns(patterns):
@@ -70,6 +73,14 @@ def compile_patterns(patterns):
 
 def matches_any_pattern(patterns, name):
     return any(pattern.fullmatch(name) for pattern in patterns)
+
+
+def with_anima_default_excludes(patterns):
+    patterns = normalize_patterns(patterns)
+    for pattern in ANIMA_DEFAULT_EXCLUDE_PATTERNS:
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
 
 
 def create_network(
@@ -160,11 +171,9 @@ def create_network(
 
     is_anima_model = is_anima_unet(unet)
     if is_anima_model:
-        exclude_patterns = normalize_patterns(kwargs.get("exclude_patterns", None))
-        for pattern in ANIMA_DEFAULT_EXCLUDE_PATTERNS:
-            if pattern not in exclude_patterns:
-                exclude_patterns.append(pattern)
-        kwargs["exclude_patterns"] = exclude_patterns
+        kwargs["exclude_patterns"] = with_anima_default_excludes(
+            kwargs.get("exclude_patterns", None)
+        )
 
     # regex-specific learning rates / dimensions
     def parse_kv_pairs(kv_pair_str: str, is_int: bool) -> dict[str, float]:
@@ -476,7 +485,12 @@ class LycorisNetworkKohya(LycorisNetwork):
 
         self.use_tucker = use_tucker
 
-        self.exclude_patterns = normalize_patterns(kwargs.get("exclude_patterns", None))
+        if self.is_anima_model:
+            self.exclude_patterns = with_anima_default_excludes(
+                kwargs.get("exclude_patterns", None)
+            )
+        else:
+            self.exclude_patterns = normalize_patterns(kwargs.get("exclude_patterns", None))
         self.include_patterns = normalize_patterns(kwargs.get("include_patterns", None))
         self.exclude_re_patterns = compile_patterns(self.exclude_patterns)
         self.include_re_patterns = compile_patterns(self.include_patterns)
@@ -776,7 +790,8 @@ class LycorisNetworkKohya(LycorisNetwork):
             if total_modules == 0:
                 logger.warning(
                     "No LyCORIS modules were created. "
-                    "This may indicate a mismatch between your LyCORIS config and the model architecture. "
+                    "This may indicate a mismatch between your LyCORIS config "
+                    "and the model architecture. "
                     "Please verify your preset/target settings match the model you are using."
                 )
 
@@ -905,7 +920,8 @@ class LycorisNetworkKohya(LycorisNetwork):
             f"LoRA+ UNet LR Ratio: {self.loraplus_unet_lr_ratio or self.loraplus_lr_ratio}"
         )
         logger.info(
-            f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}"
+            "LoRA+ Text Encoder LR Ratio: "
+            f"{self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}"
         )
 
     def prepare_optimizer_params(

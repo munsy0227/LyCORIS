@@ -561,9 +561,9 @@ class LokrModule(LycorisBaseModule):
         else:
             new_weight = base_weight + diff_weight * self.multiplier
 
-        delta_weight = new_weight - base_weight
+        delta_weight = (new_weight - base_weight).to(dtype=x.dtype)
         delta = self.op(x, delta_weight, None, **self.kw_dict)
-        return base + delta
+        return base + delta.to(dtype=base.dtype)
 
 
 if __name__ == "__main__":

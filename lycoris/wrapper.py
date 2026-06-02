@@ -82,6 +82,7 @@ def create_lycoris(
     full_matrix = str_bool(kwargs.get("full_matrix", False))
     bypass_mode = str_bool(kwargs.get("bypass_mode", False))
     unbalanced_factorization = str_bool(kwargs.get("unbalanced_factorization", False))
+    train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
 
     if unbalanced_factorization:
         logger.info("Unbalanced factorization for LoKr is enabled")
@@ -130,6 +131,7 @@ def create_lycoris(
         bypass_mode=bypass_mode,
         unbalanced_factorization=unbalanced_factorization,
         warn_on_unmatched=warn_on_unmatched,
+        train_llm_adapter=train_llm_adapter,
     )
 
     return network
@@ -244,6 +246,7 @@ class LycorisNetwork(torch.nn.Module):
         train_norm=False,
         init_only=False,
         warn_on_unmatched=True,
+        train_llm_adapter=False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -264,6 +267,7 @@ class LycorisNetwork(torch.nn.Module):
             return
         self.multiplier = multiplier
         self.lora_dim = lora_dim
+        self.train_llm_adapter = train_llm_adapter
 
         if not self.ENABLE_CONV:
             conv_lora_dim = 0
@@ -485,6 +489,11 @@ class LycorisNetwork(torch.nn.Module):
                 ]
             )
         )
+
+        if not self.train_llm_adapter:
+            if "LLMAdapterTransformerBlock" in target_modules:
+                target_modules.remove("LLMAdapterTransformerBlock")
+
         self.loras, matched_modules, matched_names = create_modules(
             LycorisNetwork.LORA_PREFIX,
             module,

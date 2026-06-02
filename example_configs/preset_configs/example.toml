@@ -13,7 +13,7 @@ unet_target_module = [
   "MMDoubleStreamBlock", #HunYuanVideo
   "MMSingleStreamBlock", #HunYuanVideo
   "JointTransformerBlock", # lumina-image-2
-  "FinalLayer", # lumina-image-2
+  "FinalLayer", # lumina-image-2, Anima
 ]
 unet_target_name = [
   "conv_in",

@@ -1,5 +1,5 @@
+import os
 import unittest
-import re
 
 from itertools import product
 from parameterized import parameterized
@@ -7,9 +7,13 @@ from parameterized import parameterized
 import torch
 import torch.nn as nn
 
-from diffusers import FluxTransformer2DModel
+from lycoris import LycorisNetwork, create_lycoris, create_lycoris_from_weights
 
-from lycoris import create_lycoris, create_lycoris_from_weights, LycorisNetwork
+RUN_FLUX_INTEGRATION = os.environ.get("LYCORIS_RUN_FLUX_INTEGRATION") == "1"
+if RUN_FLUX_INTEGRATION:
+    from diffusers import FluxTransformer2DModel
+else:
+    FluxTransformer2DModel = None
 
 
 def reset_globals():
@@ -392,6 +396,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_target_module_and_module_algo_map(self):
         try:
             transformer = FluxTransformer2DModel.from_config(
@@ -515,6 +523,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_whole_model(self):
         try:
             transformer = FluxTransformer2DModel.from_config(
@@ -665,6 +677,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_fnmatch(self):
         try:
             transformer = FluxTransformer2DModel.from_config(
@@ -763,6 +779,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_fnmatch_and_exclude(self):
         try:
             transformer = FluxTransformer2DModel.from_config(

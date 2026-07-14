@@ -4,22 +4,20 @@ import fnmatch
 import re
 import logging
 
-from typing import Any, List
+from typing import Any
 
 import torch
 
 from .utils import precalculate_safetensors_hashes
-from .wrapper import LycorisNetwork, network_module_dict, deprecated_arg_dict
-from .modules.locon import LoConModule
-from .modules.loha import LohaModule
-from .modules.ia3 import IA3Module
-from .modules.lokr import LokrModule
-from .modules.dylora import DyLoraModule
+from .wrapper import (
+    LycorisNetwork,
+    deprecated_arg_dict,
+    merge_module_options,
+    network_module_dict,
+    normalize_module_options,
+)
 from .modules.glora import GLoRAModule
 from .modules.norms import NormModule
-from .modules.full import FullModule
-from .modules.diag_oft import DiagOFTModule
-from .modules.boft import ButterflyOFTModule
 from .modules import make_module, get_module
 
 from .config import PRESET
@@ -28,9 +26,7 @@ from .utils import str_bool
 from .logging import logger
 
 
-ANIMA_DEFAULT_EXCLUDE_PATTERNS = (
-    r".*(_modulation|_norm|_embedder|final_layer).*",
-)
+ANIMA_DEFAULT_EXCLUDE_PATTERNS = (r".*(_modulation|_norm|_embedder|final_layer).*",)
 ANIMA_REQUIRED_MODULE_CLASSES = {"Block", "PatchEmbed", "TimestepEmbedding"}
 
 
@@ -119,11 +115,15 @@ def create_network(
     train_norm = str_bool(kwargs.get("train_norm", False))
     constraint = float(kwargs.get("constraint", None) or 0)
     rescaled = str_bool(kwargs.get("rescaled", False))
-    weight_decompose = str_bool(kwargs.get("dora_wd", False))
-    wd_on_output = str_bool(kwargs.get("wd_on_output", True))
+    weight_decompose = str_bool(
+        kwargs.get("dora_wd", kwargs.get("weight_decompose", False))
+    )
+    wd_on_output = str_bool(kwargs.get("wd_on_output", kwargs.get("wd_on_out", True)))
     full_matrix = str_bool(kwargs.get("full_matrix", False))
     bypass_mode = str_bool(kwargs.get("bypass_mode", False))
     rs_lora = str_bool(kwargs.get("rs_lora", False))
+    rank_dropout_scale = str_bool(kwargs.get("rank_dropout_scale", False))
+    decompose_both = str_bool(kwargs.get("decompose_both", False))
     unbalanced_factorization = str_bool(kwargs.get("unbalanced_factorization", False))
     train_t5xxl = str_bool(kwargs.get("train_t5xxl", False))
     train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
@@ -224,8 +224,9 @@ def create_network(
         use_scalar=use_scalar,
         network_module=algo,
         train_norm=train_norm,
-        decompose_both=kwargs.get("decompose_both", False),
+        decompose_both=decompose_both,
         factor=kwargs.get("factor", -1),
+        rank_dropout_scale=rank_dropout_scale,
         block_size=block_size,
         constraint=constraint,
         rescaled=rescaled,
@@ -266,7 +267,7 @@ def create_network_from_weights(
 ):
     if weights_sd is None:
         if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import load_file, safe_open
+            from safetensors.torch import load_file
 
             weights_sd = load_file(file)
         else:
@@ -300,7 +301,7 @@ def create_network_from_weights(
 
         for idx, te in enumerate(text_encoders):
             if use_index:
-                prefix = f"{LycorisNetworkKohya.LORA_PREFIX_TEXT_ENCODER}{idx+1}"
+                prefix = f"{LycorisNetworkKohya.LORA_PREFIX_TEXT_ENCODER}{idx + 1}"
             else:
                 prefix = LycorisNetworkKohya.LORA_PREFIX_TEXT_ENCODER
             for name, modules in te.named_modules():
@@ -447,11 +448,19 @@ class LycorisNetworkKohya(LycorisNetwork):
         **kwargs,
     ) -> None:
         torch.nn.Module.__init__(self)
-        root_kwargs = kwargs
+        root_kwargs = normalize_module_options(kwargs)
+        dropout = float(dropout)
+        rank_dropout = float(rank_dropout)
+        module_dropout = float(module_dropout)
+        train_norm = str_bool(train_norm) if isinstance(train_norm, str) else train_norm
         self.multiplier = multiplier
         self.lora_dim = lora_dim
         self.train_t5xxl = train_t5xxl
-        self.train_llm_adapter = train_llm_adapter
+        self.train_llm_adapter = (
+            str_bool(train_llm_adapter)
+            if isinstance(train_llm_adapter, str)
+            else train_llm_adapter
+        )
         self.reg_dims = reg_dims
         self.reg_lrs = reg_lrs
         self.is_anima_model = is_anima_model
@@ -483,14 +492,18 @@ class LycorisNetworkKohya(LycorisNetwork):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
 
-        self.use_tucker = use_tucker
+        self.use_tucker = (
+            str_bool(use_tucker) if isinstance(use_tucker, str) else use_tucker
+        )
 
         if self.is_anima_model:
             self.exclude_patterns = with_anima_default_excludes(
                 kwargs.get("exclude_patterns", None)
             )
         else:
-            self.exclude_patterns = normalize_patterns(kwargs.get("exclude_patterns", None))
+            self.exclude_patterns = normalize_patterns(
+                kwargs.get("exclude_patterns", None)
+            )
         self.include_patterns = normalize_patterns(kwargs.get("include_patterns", None))
         self.exclude_re_patterns = compile_patterns(self.exclude_patterns)
         self.include_re_patterns = compile_patterns(self.include_patterns)
@@ -501,22 +514,33 @@ class LycorisNetworkKohya(LycorisNetwork):
             algo_name,
             dim=None,
             alpha=None,
-            use_tucker=self.use_tucker,
+            use_tucker=None,
             original_name=None,
             **kwargs,
         ):
-            for k, v in root_kwargs.items():
-                if k in kwargs:
-                    continue
-                kwargs[k] = v
+            local_options = dict(kwargs)
+            if use_tucker is not None:
+                local_options["use_tucker"] = use_tucker
+            kwargs = merge_module_options(root_kwargs, local_options)
+            use_tucker = kwargs.pop("use_tucker", self.use_tucker)
+            configured_dim = kwargs.pop("dim", None)
+            configured_alpha = kwargs.pop("alpha", None)
+            dim = dim if dim is not None else configured_dim
+            alpha = alpha if alpha is not None else configured_alpha
+            kwargs.pop("algo", None)
+            adapter_dropout = float(kwargs.pop("dropout", self.dropout))
+            adapter_rank_dropout = float(kwargs.pop("rank_dropout", self.rank_dropout))
+            adapter_module_dropout = float(
+                kwargs.pop("module_dropout", self.module_dropout)
+            )
 
             if train_norm and "Norm" in module.__class__.__name__:
                 return norm_modules(
                     lora_name,
                     module,
                     self.multiplier,
-                    self.rank_dropout,
-                    self.module_dropout,
+                    adapter_rank_dropout,
+                    adapter_module_dropout,
                     **kwargs,
                 )
 
@@ -557,9 +581,9 @@ class LycorisNetworkKohya(LycorisNetwork):
                 self.multiplier,
                 dim,
                 alpha,
-                self.dropout,
-                self.rank_dropout,
-                self.module_dropout,
+                adapter_dropout,
+                adapter_rank_dropout,
+                adapter_module_dropout,
                 use_tucker,
                 **kwargs,
             )
@@ -718,7 +742,7 @@ class LycorisNetworkKohya(LycorisNetwork):
             for i, te in enumerate(text_encoders):
                 loras, matched_mods, matched_nms = create_modules(
                     LycorisNetworkKohya.LORA_PREFIX_TEXT_ENCODER
-                    + (f"{i+1}" if use_index else ""),
+                    + (f"{i + 1}" if use_index else ""),
                     te,
                     LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_MODULE,
                     LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_NAME,
@@ -808,9 +832,9 @@ class LycorisNetworkKohya(LycorisNetwork):
         # assertion
         names = set()
         for lora in self.loras:
-            assert (
-                lora.lora_name not in names
-            ), f"duplicated lora name: {lora.lora_name}"
+            assert lora.lora_name not in names, (
+                f"duplicated lora name: {lora.lora_name}"
+            )
             names.add(lora.lora_name)
 
     def match_fn(self, pattern: str, name: str) -> bool:
@@ -833,7 +857,7 @@ class LycorisNetworkKohya(LycorisNetwork):
 
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import load_file, safe_open
+            from safetensors.torch import load_file
 
             self.weights_sd = load_file(file)
         else:
@@ -847,9 +871,9 @@ class LycorisNetworkKohya(LycorisNetwork):
         return state
 
     def apply_to(self, text_encoder, unet, apply_text_encoder=None, apply_unet=None):
-        assert (
-            apply_text_encoder is not None and apply_unet is not None
-        ), f"internal error: flag not set"
+        assert apply_text_encoder is not None and apply_unet is not None, (
+            "internal error: flag not set"
+        )
 
         if apply_text_encoder:
             logger.info("enable LyCORIS for text encoder")
@@ -892,7 +916,8 @@ class LycorisNetworkKohya(LycorisNetwork):
             self.unet_loras = []
 
         self.loras = self.text_encoder_loras + self.unet_loras
-        super().merge_to(1)
+        # This path writes a final checkpoint and never unmerges in memory.
+        super().merge_to(1, reversible=False)
 
     def apply_max_norm_regularization(self, max_norm_value, device):
         key_scaled = 0

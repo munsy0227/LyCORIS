@@ -140,6 +140,38 @@ We can reduce the number of parameters to the order of square root of matrix wid
   <img width="460" src="images/lokr-linear.png">
 </p>
 
+### LoKr with DoRA
+
+Let the scaled LoKr update be
+$\Delta W = s(W_1 \otimes W_2)$ and let $W_0$ be the frozen base weight.
+DoRA separates the adapted weight into a direction and a trainable magnitude:
+
+$$V = W_0 + \Delta W$$
+
+$$W_{\mathrm{DoRA}} = V \frac{m}{\lVert V \rVert}$$
+
+The magnitude $m$ is initialized from the corresponding norm of $W_0$.
+By default, norms are computed independently for each output row. With
+`wd_on_output=False`, they are computed along the input axis instead. The
+direction norm is detached during backpropagation, following the DoRA
+formulation.
+
+For grouped convolutions, input-axis magnitude is indexed by convolution group
+and local input channel. This avoids coupling unrelated groups that happen to
+share the same local channel index.
+
+LyCORIS applies a runtime multiplier $\lambda$ to the complete DoRA residual:
+
+$$W_{\mathrm{eff}} = W_0 + \lambda(W_{\mathrm{DoRA}} - W_0)$$
+
+Therefore, $\lambda=0$ exactly recovers the base weight and $\lambda=1$ applies
+the full DoRA adapter. When both Kronecker factors are full matrices, LoKr uses
+unit scaling rather than alpha/rank scaling.
+
+Reversible LoKr merges retain the original target weight on CPU because DoRA
+composition is not additive. For memory-constrained inference, use a
+non-reversible merge or finalize the ledger after verifying the merged model.
+
 ## Sparse Bias
 Todo...
 

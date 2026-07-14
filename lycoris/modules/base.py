@@ -1,3 +1,4 @@
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -6,12 +7,50 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 
-from ..utils.quant import QuantLinears, log_bypass, log_suspect
+from ..utils.quant import (
+    QuantLinears,
+    dequantize_module_weight,
+    log_bypass,
+    log_suspect,
+)
 
 try:
     from peft.tuners.tuners_utils import BaseTunerLayer
 except Exception:  # pragma: no cover - PEFT is optional
     BaseTunerLayer = None
+
+
+def _is_additive_lokr_stack_adapter(adapter: nn.Module) -> bool:
+    """Return whether ``adapter`` composes with additive LoKr exactly.
+
+    Only adapters whose residual is independent of the target's current base
+    weight can be reordered with an additive LoKr wrapper.  Unknown adapters
+    are deliberately treated as base-dependent.
+    """
+
+    return getattr(adapter, "name", None) in {"locon", "loha", "tlora"} and not getattr(
+        adapter, "wd", False
+    )
+
+
+def _ensure_target_unwrapped_for_merge(
+    module: nn.Module,
+    adapter: nn.Module | None = None,
+) -> None:
+    if adapter is not None and getattr(
+        adapter,
+        "_lycoris_is_parametrization",
+        False,
+    ):
+        raise RuntimeError(
+            "A parametrization adapter cannot be merged destructively while "
+            "the parametrization is active. Remove the parametrization first."
+        )
+    if getattr(module, "_lycoris_wrappers", []):
+        raise RuntimeError(
+            "Restore all adapters from the target before merging them into "
+            "its weight; otherwise the forward path would apply them twice."
+        )
 
 
 class ModuleCustomSD(nn.Module):
@@ -59,6 +98,8 @@ class ModuleCustomSD(nn.Module):
 
         if (custom_sd := self.custom_state_dict()) is not None:
             for k, v in custom_sd.items():
+                if isinstance(v, torch.Tensor) and not keep_vars:
+                    v = v.detach()
                 destination[f"{prefix}{k}"] = v
             return destination
         else:
@@ -104,9 +145,13 @@ class LycorisBaseModule(ModuleCustomSD):
         self.lora_name = lora_name
         self.not_supported = False
 
-        self.peft_wrapper = None
+        # Keep the optional PEFT wrapper as a plain reference.  Registering it
+        # as a child module would make its base-model parameters appear in the
+        # adapter optimizer/state dict and would let adapter ``to()`` calls move
+        # the entire wrapped layer.
+        object.__setattr__(self, "peft_wrapper", None)
         if BaseTunerLayer is not None and isinstance(org_module, BaseTunerLayer):
-            self.peft_wrapper = org_module
+            object.__setattr__(self, "peft_wrapper", org_module)
             base_layer = getattr(org_module, "base_layer", None)
             if base_layer is None and hasattr(org_module, "get_base_layer"):
                 base_layer = org_module.get_base_layer()
@@ -122,11 +167,7 @@ class LycorisBaseModule(ModuleCustomSD):
             self.kw_dict = {}
         elif isinstance(org_module, nn.Conv1d):
             self.module_type = "conv1d"
-            self.shape = (
-                org_module.out_channels,
-                org_module.in_channels,
-                *org_module.kernel_size,
-            )
+            self.shape = tuple(org_module.weight.shape)
             self.op = F.conv1d
             self.dim = org_module.out_channels
             self.kw_dict = {
@@ -137,11 +178,7 @@ class LycorisBaseModule(ModuleCustomSD):
             }
         elif isinstance(org_module, nn.Conv2d):
             self.module_type = "conv2d"
-            self.shape = (
-                org_module.out_channels,
-                org_module.in_channels,
-                *org_module.kernel_size,
-            )
+            self.shape = tuple(org_module.weight.shape)
             self.op = F.conv2d
             self.dim = org_module.out_channels
             self.kw_dict = {
@@ -152,11 +189,7 @@ class LycorisBaseModule(ModuleCustomSD):
             }
         elif isinstance(org_module, nn.Conv3d):
             self.module_type = "conv3d"
-            self.shape = (
-                org_module.out_channels,
-                org_module.in_channels,
-                *org_module.kernel_size,
-            )
+            self.shape = tuple(org_module.weight.shape)
             self.op = F.conv3d
             self.dim = org_module.out_channels
             self.kw_dict = {
@@ -200,7 +233,7 @@ class LycorisBaseModule(ModuleCustomSD):
             if bypass_mode is None:
                 log_suspect()
                 bypass_mode = True
-            if bypass_mode == True:
+            if bypass_mode is True:
                 self.is_quant = True
         self.bypass_mode = bypass_mode
         self.dropout = dropout
@@ -234,10 +267,10 @@ class LycorisBaseModule(ModuleCustomSD):
         kwargs["bypass_mode"] = False
         if target_param.dim() == 2:
             proxy_module = nn.Linear(
-                target_param.shape[0], target_param.shape[1], bias=False
+                target_param.shape[1], target_param.shape[0], bias=False
             )
             proxy_module.weight = target_param
-        elif target_param.dim() > 2:
+        elif target_param.dim() in (3, 4, 5):
             module_type = [
                 None,
                 None,
@@ -248,14 +281,37 @@ class LycorisBaseModule(ModuleCustomSD):
                 None,
                 None,
             ][target_param.dim()]
+            groups = 1
+            in_channels = target_param.shape[1]
+            if attr == "weight" and isinstance(
+                org_module,
+                (nn.Conv1d, nn.Conv2d, nn.Conv3d),
+            ):
+                groups = org_module.groups
+                in_channels = target_param.shape[1] * groups
+                if in_channels != org_module.in_channels:
+                    raise ValueError(
+                        "Convolution metadata does not match the parameterized "
+                        f"weight: in_channels={org_module.in_channels}, "
+                        f"weight={tuple(target_param.shape)}, groups={groups}."
+                    )
             proxy_module = module_type(
-                target_param.shape[0],
-                target_param.shape[1],
-                *target_param.shape[2:],
+                in_channels=in_channels,
+                out_channels=target_param.shape[0],
+                kernel_size=tuple(target_param.shape[2:]),
+                groups=groups,
                 bias=False,
+                device=target_param.device,
+                dtype=target_param.dtype,
             )
             proxy_module.weight = target_param
+        else:
+            raise ValueError(
+                "Only matrix and Conv1d/2d/3d-shaped parameters can be "
+                f"parameterized, got shape {tuple(target_param.shape)}."
+            )
         module_obj = cls("", proxy_module, *args, **kwargs)
+        module_obj._lycoris_is_parametrization = True
         module_obj.forward = module_obj.parametrize_forward
         module_obj.to(target_param)
         parametrize.register_parametrization(org_module, attr, module_obj)
@@ -287,26 +343,71 @@ class LycorisBaseModule(ModuleCustomSD):
 
     @org_weight.setter
     def org_weight(self, value):
-        self.org_module[0].weight.data.copy_(value)
+        with torch.no_grad():
+            self.org_module[0].weight.copy_(value)
 
     def _current_weight(self):
+        if not hasattr(self.org_module[0], "weight"):
+            return self.org_weight.detach()
+        if self.is_quant:
+            return dequantize_module_weight(self.org_module[0]).detach()
         return self.org_module[0].weight.detach()
 
     def _current_bias(self):
+        if not hasattr(self.org_module[0], "bias"):
+            org_bias = getattr(self, "org_bias", None)
+            return None if org_bias is None else org_bias[0].detach()
         bias = self.org_module[0].bias
         return None if bias is None else bias.detach()
+
+    def _weight_forward(self, x, weight, bias=None):
+        kwargs = self.kw_dict
+        if self.module_type.startswith("conv"):
+            module = self.org_module[0]
+            if module.padding_mode != "zeros":
+                x = F.pad(
+                    x,
+                    module._reversed_padding_repeated_twice,
+                    mode=module.padding_mode,
+                )
+                kwargs = {**self.kw_dict, "padding": 0}
+        return self.op(x, weight, bias, **kwargs)
 
     def apply_to(self, **kwargs):
         if self.not_supported:
             return
 
         module = self.org_module[0]
+        if getattr(module, "_lycoris_onfly_stack", []):
+            raise RuntimeError(
+                "Restore the target's on-the-fly merge stack before applying "
+                "a forward adapter."
+            )
         if not hasattr(module, "_lycoris_original_forward"):
             module._lycoris_original_forward = module.forward
 
         wrappers = list(getattr(module, "_lycoris_wrappers", []))
         if self in wrappers:
-            wrappers.remove(self)
+            return
+        if any(getattr(wrapper, "name", None) == "full" for wrapper in wrappers):
+            raise RuntimeError(
+                "FullModule cannot be stacked with another adapter on the same target."
+            )
+        lokr_wrappers = [
+            wrapper for wrapper in wrappers if getattr(wrapper, "name", None) == "kron"
+        ]
+        if (
+            getattr(self, "name", None) != "kron"
+            and lokr_wrappers
+            and (
+                not _is_additive_lokr_stack_adapter(self)
+                or any(getattr(wrapper, "wd", False) for wrapper in lokr_wrappers)
+            )
+        ):
+            raise RuntimeError(
+                "Stacking LoKr with this adapter on the same target is not "
+                "supported because the composition is base- or order-dependent."
+            )
 
         self.org_forward = module.forward
         wrappers.append(self)
@@ -351,9 +452,29 @@ class LycorisBaseModule(ModuleCustomSD):
             module.__dict__.pop("_lycoris_wrappers", None)
             module.__dict__.pop("_lycoris_original_forward", None)
 
-    def merge_to(self, multiplier=1.0, *, precise: bool = False):
+    @torch.no_grad()
+    def merge_to(
+        self,
+        multiplier=1.0,
+        *,
+        precise: bool = False,
+        reversible: bool = True,
+    ):
         if self.not_supported:
             return
+
+        module = self.org_module[0]
+        _ensure_target_unwrapped_for_merge(module, self)
+        if getattr(module, "_lycoris_onfly_stack", []):
+            raise RuntimeError(
+                "Cannot permanently merge an adapter while an on-the-fly "
+                "merge is active on the target."
+            )
+        if getattr(module, "_lycoris_lokr_merge_entries", {}):
+            raise RuntimeError(
+                "Cannot merge a different adapter while a reversible LoKr "
+                "merge is active on the target; undo or finalize LoKr first."
+            )
 
         ctx = self._prepare_merge_context(precise)
 
@@ -369,38 +490,205 @@ class LycorisBaseModule(ModuleCustomSD):
             self._apply_merged_weights(ctx, weight, bias)
 
         self._restore_merge_context(ctx)
+        if not reversible:
+            self.finalize_merge()
 
+    @torch.no_grad()
+    def finalize_merge(self):
+        """Keep merged values and discard optional precise merge snapshots."""
+        module = self.org_module[0]
+        removed = False
+        for name in (
+            "_lycoris_precise_weight_base",
+            "_lycoris_precise_weight_current",
+            "_lycoris_precise_bias_base",
+            "_lycoris_precise_bias_current",
+        ):
+            if name in module.__dict__:
+                module.__dict__.pop(name)
+                removed = True
+        return removed
+
+    @torch.no_grad()
     def onfly_merge(self, multiplier=1.0):
         if self.not_supported:
             return
-        self_device = next(self.parameters()).device
-        self_dtype = next(self.parameters()).dtype
-        self.to(self.org_weight)
-        self.cached_org_weight = self.org_weight.data.cpu()
-        self.cached_org_bias = None
-        weight, bias = self.get_merged_weight(
-            multiplier, self.org_weight.shape, self.org_weight.device
-        )
-        self.org_weight = weight
-        if bias is not None:
-            bias = bias.to(self.org_weight)
-            if self.org_module[0].bias is not None:
-                self.org_module[0].bias.data.copy_(bias)
-                self.cached_org_bias = self.org_module[0].bias.data.cpu()
-            else:
-                self.org_module[0].bias = nn.Parameter(bias)
-        if self.org_module[0].bias is not None:
-            self.org_module[0].bias = self.org_module[0].bias.to(self.org_weight)
-        self.to(self_device, self_dtype)
+        multiplier = float(multiplier)
+        if not math.isfinite(multiplier):
+            raise ValueError(
+                f"On-the-fly merge multiplier must be finite, got {multiplier}."
+            )
+        if hasattr(self, "_lycoris_onfly_active"):
+            raise RuntimeError("onfly_merge() called twice without onfly_restore().")
 
+        module = self.org_module[0]
+        _ensure_target_unwrapped_for_merge(module, self)
+        if getattr(module, "_lycoris_lokr_merge_entries", {}):
+            raise RuntimeError(
+                "Cannot use an on-the-fly merge while a reversible LoKr "
+                "merge is active on the target."
+            )
+        stack = list(getattr(module, "_lycoris_onfly_stack", []))
+        if any(
+            getattr(frame.get("adapter"), "name", None) == "kron" for frame in stack
+        ):
+            raise RuntimeError(
+                "Mixing LoKr and a different adapter in one target's "
+                "on-the-fly merge stack is not supported."
+            )
+        if stack:
+            active_frame = stack[-1]
+            if module.weight is not active_frame["weight_param"]:
+                raise RuntimeError(
+                    "The target weight Parameter was replaced during an "
+                    "on-the-fly merge; refusing to extend the stack."
+                )
+            if module.weight._version != active_frame["weight_version"]:
+                raise RuntimeError(
+                    "The target weight changed during an on-the-fly merge; "
+                    "refusing to extend the stack."
+                )
+            if module.bias is not active_frame["bias_param"]:
+                raise RuntimeError(
+                    "The target bias Parameter was replaced during an "
+                    "on-the-fly merge; refusing to extend the stack."
+                )
+            if (
+                module.bias is not None
+                and module.bias._version != active_frame["bias_version"]
+            ):
+                raise RuntimeError(
+                    "The target bias changed during an on-the-fly merge; "
+                    "refusing to extend the stack."
+                )
+
+        parameters = tuple(self.parameters())
+        first_parameter = parameters[0] if parameters else None
+        self_device = first_parameter.device if first_parameter is not None else None
+        self_dtype = first_parameter.dtype if first_parameter is not None else None
+        original_weight = None
+        original_bias = module.bias
+        original_bias_exists = original_bias is not None
+        original_bias_value = None
+        try:
+            if multiplier != 0:
+                original_weight = self.org_weight.detach().cpu().clone()
+                original_bias_value = (
+                    original_bias.detach().cpu().clone()
+                    if original_bias is not None
+                    else None
+                )
+                self.to(self.org_weight)
+                weight, bias = self.get_merged_weight(
+                    multiplier,
+                    self.org_weight.shape,
+                    self.org_weight.device,
+                )
+                self.org_weight = weight
+                if bias is not None:
+                    if original_bias is not None:
+                        original_bias.copy_(bias.to(original_bias))
+                    else:
+                        module.bias = nn.Parameter(bias.to(self.org_weight))
+
+            self.cached_org_weight = original_weight
+            self.cached_org_bias_exists = original_bias_exists
+            self.cached_org_bias = original_bias_value
+            self._lycoris_onfly_active = True
+            stack.append(
+                {
+                    "adapter": self,
+                    "kind": "generic",
+                    "weight_param": module.weight,
+                    "weight_version": module.weight._version,
+                    "bias_param": module.bias,
+                    "bias_version": (
+                        module.bias._version if module.bias is not None else None
+                    ),
+                    "multiplier": multiplier,
+                }
+            )
+            module._lycoris_onfly_stack = stack
+        except Exception:
+            if original_weight is not None:
+                self.org_weight = original_weight.to(self.org_weight)
+            if original_bias_exists:
+                if module.bias is original_bias:
+                    original_bias.copy_(original_bias_value.to(original_bias))
+                else:
+                    module.bias = original_bias
+            elif module.bias is not None:
+                module.bias = None
+            for name in (
+                "cached_org_weight",
+                "cached_org_bias",
+                "cached_org_bias_exists",
+                "_lycoris_onfly_active",
+            ):
+                self.__dict__.pop(name, None)
+            raise
+        finally:
+            if self_device is not None and self_dtype is not None:
+                self.to(device=self_device, dtype=self_dtype)
+
+    @torch.no_grad()
     def onfly_restore(self):
         if self.not_supported:
             return
-        self.org_weight = self.cached_org_weight.to(self.org_weight)
-        if self.cached_org_bias is not None:
-            self.org_module[0].bias.data.copy_(self.cached_org_bias.to(self.org_weight))
-        del self.cached_org_weight
-        del self.cached_org_bias
+        if not hasattr(self, "_lycoris_onfly_active"):
+            raise RuntimeError("onfly_restore() called without onfly_merge().")
+        module = self.org_module[0]
+        stack = list(getattr(module, "_lycoris_onfly_stack", []))
+        if not stack or stack[-1].get("adapter") is not self:
+            raise RuntimeError(
+                "On-the-fly adapters must be restored in reverse merge order."
+            )
+        frame = stack[-1]
+        if module.weight is not frame["weight_param"]:
+            raise RuntimeError(
+                "The target weight Parameter was replaced during an "
+                "on-the-fly merge; refusing to overwrite it."
+            )
+        if module.weight._version != frame["weight_version"]:
+            raise RuntimeError(
+                "The target weight changed during an on-the-fly merge; "
+                "refusing to overwrite the external update."
+            )
+        if module.bias is not frame["bias_param"]:
+            raise RuntimeError(
+                "The target bias Parameter was replaced during an "
+                "on-the-fly merge; refusing to overwrite it."
+            )
+        if module.bias is not None and module.bias._version != frame["bias_version"]:
+            raise RuntimeError(
+                "The target bias changed during an on-the-fly merge; "
+                "refusing to overwrite the external update."
+            )
+
+        if frame["multiplier"] != 0:
+            self.org_weight = self.cached_org_weight.to(self.org_weight)
+            if self.cached_org_bias_exists:
+                module.bias.copy_(self.cached_org_bias.to(module.bias))
+            else:
+                module.bias = None
+
+        stack.pop()
+        for name in (
+            "cached_org_weight",
+            "cached_org_bias",
+            "cached_org_bias_exists",
+            "_lycoris_onfly_active",
+        ):
+            self.__dict__.pop(name, None)
+        if stack:
+            stack[-1]["weight_version"] = module.weight._version
+            stack[-1]["bias_param"] = module.bias
+            stack[-1]["bias_version"] = (
+                module.bias._version if module.bias is not None else None
+            )
+            module._lycoris_onfly_stack = stack
+        else:
+            module.__dict__.pop("_lycoris_onfly_stack", None)
 
     def get_diff_weight(self, multiplier=1.0, shape=None, device=None):
         raise NotImplementedError
@@ -476,12 +764,12 @@ class LycorisBaseModule(ModuleCustomSD):
         bias: torch.Tensor | None,
     ) -> None:
         merged_weight = weight.to(ctx.target_dtype)
-        ctx.weight_param.data.copy_(merged_weight)
+        ctx.weight_param.copy_(merged_weight)
 
         if bias is not None:
             merged_bias = bias.to(ctx.target_dtype)
             if ctx.bias_param is not None:
-                ctx.bias_param.data.copy_(merged_bias)
+                ctx.bias_param.copy_(merged_bias)
             else:
                 ctx.module.bias = nn.Parameter(merged_bias)
         elif ctx.bias_param is None:
@@ -541,13 +829,11 @@ class LycorisBaseModule(ModuleCustomSD):
         weight_prec: torch.Tensor,
         bias_prec: torch.Tensor | None,
     ) -> None:
-        ctx.weight_param.data.copy_(weight_prec.to(ctx.target_device, ctx.target_dtype))
+        ctx.weight_param.copy_(weight_prec.to(ctx.target_device, ctx.target_dtype))
 
         if bias_prec is not None:
             if ctx.bias_param is not None:
-                ctx.bias_param.data.copy_(
-                    bias_prec.to(ctx.target_device, ctx.target_dtype)
-                )
+                ctx.bias_param.copy_(bias_prec.to(ctx.target_device, ctx.target_dtype))
             else:
                 ctx.module.bias = nn.Parameter(
                     bias_prec.to(ctx.target_device, ctx.target_dtype)
@@ -594,7 +880,7 @@ class LycorisBaseModule(ModuleCustomSD):
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        weight_param.data.copy_(
+        weight_param.copy_(
             module._lycoris_precise_weight_current.to(device=device, dtype=dtype)
         )
         if bias_param is not None:
@@ -603,4 +889,4 @@ class LycorisBaseModule(ModuleCustomSD):
                 bias_snapshot = module._lycoris_precise_bias_base
                 module._lycoris_precise_bias_current = bias_snapshot
             if bias_snapshot is not None:
-                bias_param.data.copy_(bias_snapshot.to(device=device, dtype=dtype))
+                bias_param.copy_(bias_snapshot.to(device=device, dtype=dtype))

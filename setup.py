@@ -10,7 +10,14 @@ setup(
     author="Shih-Ying Yeh(KohakuBlueLeaf), Yu-Guan Hsieh, Zhidong Gao",
     author_email="kohaku@kblueleaf.net",
     zip_safe=False,
-    install_requires=["torch", "einops", "toml", "tqdm"],
+    install_requires=[
+        "torch",
+        "einops",
+        "numpy",
+        "safetensors",
+        "toml",
+        "tqdm",
+    ],
     python_requires=">=3.10",
     license="Apache-2.0",
     classifiers=[

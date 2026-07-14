@@ -7,8 +7,8 @@ from lycoris.functional import loha, lokr
 
 org_model = nn.Linear(128, 128)
 # Call the Functional API to get weights
-lokr_weights = lokr.weight_gen(org_model.weight)
-loha_weights = loha.weight_gen(org_model.weight)
+lokr_weights = lokr.weight_gen(org_model.weight, rank=4)
+loha_weights = loha.weight_gen(org_model.weight, rank=4)
 
 test_x = torch.randn(1, 128)
 test_out = org_model(test_x)

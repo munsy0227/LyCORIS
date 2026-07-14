@@ -19,6 +19,7 @@ exps/
 *.pt
 *.ckpt
 test*.py
+!test/test_lokr.py
 
 # Editors
 .vscode/

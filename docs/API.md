@@ -20,6 +20,9 @@
   * `apply_to`
   * `restore`
   * `merge_to`
+  * `finalize_merge`
+  * `onfly_merge`
+  * `onfly_restore`
   * `get_diff_weight`
   * `get_merged_weight`
   * `apply_max_norm`
@@ -49,7 +52,7 @@
 For each modules, we have 3 basic methods:
 
 * `weight_gen`: Generate weights for corresponding algorithm
-* `weight_diff`: calculate $\Delta W$
+* `diff_weight`: calculate $\Delta W$
 * `bypass_forward_diff`: calculate $\Delta W X$
 
 There are some other utilities:
@@ -68,17 +71,18 @@ For all the functional API, you can directly use any kind of them with following
 
 ```python
 from lycoris.functional import xxx
-weights = xxx.weight_gen(org_weight)
+weights = xxx.weight_gen(org_weight, rank=4)
 
 def forward_with_diff_weight(x, org_weight, weights):
-    return org_forward(x, org_weight + xxx.weight_diff(*weights))
+    return org_forward(x, org_weight + xxx.diff_weight(*weights))
 
 def forward_with_diff_activation(x, org_weight, weights):
     org_out = org_forward(x, org_weight)
     return org_out + xxx.bypass_forward_diff(x, org_out, *weights)
 ```
 
-Although different algorithm will have different extra arguments for weight_diff and bypass_forward_diff, the overall logic is same.
+Although different algorithms have different extra arguments for `diff_weight`
+and `bypass_forward_diff`, the overall logic is the same.
 
 ## Others
 
@@ -88,7 +92,32 @@ Although different algorithm will have different extra arguments for weight_diff
 * `create_lycoris`: see example
 * `create_lycoris_from_weights`: see example
 
-`LycorisNetwork.apply_to()` can be invoked multiple times on the same module with different wrapper instances. Each wrapper is stacked on top of the previous one, and calling `restore()` on a wrapper removes only its own contribution while keeping earlier wrappers active.
+`LycorisNetwork.apply_to()` can be invoked multiple times with different wrapper
+instances. Multiple LoKr wrappers may share a target. An additive, non-DoRA
+LoKr may also share a target with non-DoRA LoCon, LoHa, or T-LoRA. FullModule
+is exclusive, and base- or order-dependent cross-algorithm combinations are
+rejected. Calling `restore()` removes only that wrapper's forward contribution.
+
+LoKr uses a reversible merge ledger by default so non-additive DoRA composition
+can be undone exactly with the opposite multiplier. This keeps one CPU copy of
+the original target weight. Use `merge_to(..., reversible=False)` when the merge
+will never be undone, or call `finalize_merge()` after a reversible merge, to
+keep the current weight and release that ledger. A finalized or non-reversible
+DoRA merge cannot be recovered by applying a negative multiplier, and the
+committed adapter cannot be applied or merged again. Restore all forward
+wrappers, remove active parametrizations, and restore on-the-fly changes before
+a destructive merge. A reversible network merge rejects mixed LoKr and other
+algorithms on one target. Do not train or otherwise mutate LoKr factors while a
+reversible merge ledger is active; undo or finalize the ledger before resuming
+factor updates.
+
+`onfly_restore()` must run in reverse order when multiple adapters temporarily
+modify the same target. `LycorisNetwork.onfly_restore()` performs this reversal
+automatically. The stack is shared by adapters on the target; mixing LoKr and a
+different algorithm in that stack is rejected. Network operations preflight
+all targets and roll back completed on-the-fly operations after a later
+failure. Both permanent and on-the-fly LoKr paths reject untracked target-weight
+changes instead of overwriting them.
 
 See `example/stacked_wrapper_demo.py` for a script that showcases stacking and selective removal in practice.
 

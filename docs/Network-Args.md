@@ -33,18 +33,41 @@ Arguments to put in `network_args` for kohya sd scripts
 
 - Set with `dropout=FLOAT`, `rank_dropout=FLOAT`, `module_dropout=FLOAT`
 - Set the dropout rate, the types of dropout that are valid could vary from method to method
+- Set `rank_dropout_scale=True` to divide retained LoKr rows by their keep
+  probability during training
 
 ### Factor
 
 - Set with `factor=INT`
 - Valid for LoKr
-- Use `-1` to get the smallest decomposition
+- Use `-1` to select the most balanced factorization automatically
+- Other values must be positive integers
+
+### Full Matrix LoKr
+
+- Enabled with `full_matrix=True`
+- Valid for LoKr
+- Keeps both Kronecker factors as full matrices instead of applying an
+  additional low-rank decomposition
+- Uses unit LoKr scaling, so alpha is ignored
 
 ### Decompose both
 
 - Enabled with `decompose_both=True`
 - Valid for LoKr
 - Perform LoRA decomposition of both matrices resulting from LoKr decomposition (by default only the larger matrix is decomposed)
+
+### Rank-stabilized scaling
+
+- Enabled with `rs_lora=True`
+- Valid for LoKr and other rank-scaled adapters
+- Uses alpha divided by the square root of rank instead of alpha divided by rank
+
+### Unbalanced LoKr factorization
+
+- Enabled with `unbalanced_factorization=True`
+- Valid for LoKr
+- Swaps the two output-side factors while retaining the exact target shape
 
 ### Block Size
 
@@ -71,6 +94,14 @@ Arguments to put in `network_args` for kohya sd scripts
 * Valid for LoRA, LoHa, and LoKr
 * Enable the DoRA method for these algorithms.
 * Will force `bypass_mode=False`
+* LoKr DoRA supports `full_matrix=True` and grouped Conv1d/2d/3d layers.
+* Set `wd_on_output=False` to learn magnitudes along the input axis instead of
+  the output axis.
+* For grouped convolutions, input-axis magnitudes are learned independently for
+  every group and local input channel.
+* Weight-only bitsandbytes 4-bit/8-bit and Quanto qint4/qint8 layers are
+  supported at runtime. Permanent and on-the-fly merging into a quantized
+  weight are rejected because they require backend-specific requantization.
 
 ### Bypass Mode
 

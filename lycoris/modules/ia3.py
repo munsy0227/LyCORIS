@@ -85,8 +85,7 @@ class IA3Module(LycorisBaseModule):
         return module
 
     def apply_to(self):
-        self.org_forward = self.org_module[0].forward
-        self.org_module[0].forward = self.forward
+        super().apply_to()
 
     def make_weight(self, multiplier=1, shape=None, device=None, diff=False):
         weight = self.weight * multiplier + int(not diff)

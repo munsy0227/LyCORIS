@@ -82,6 +82,7 @@ class FullModule(LycorisBaseModule):
             self.org_bias = None
 
     @classmethod
+    @torch.no_grad()
     def make_module_from_state_dict(cls, lora_name, orig_module, diff, diff_b):
         module = cls(
             lora_name,
@@ -93,42 +94,171 @@ class FullModule(LycorisBaseModule):
             if orig_module.bias is not None:
                 module.bias.copy_(diff_b)
             else:
-                module.bias = nn.Parameter(diff_b)
+                module.bias = nn.Parameter(diff_b.detach().clone())
         module.is_diff = True
         return module
 
     @property
     def org_weight(self):
+        module = self.org_module[0]
+        if self.is_diff and hasattr(module, "weight"):
+            return module.weight
         return self._org_weight[0]
 
     @org_weight.setter
     def org_weight(self, value):
-        self.org_module[0].weight.data.copy_(value)
+        with torch.no_grad():
+            self.org_module[0].weight.copy_(value)
+
+    def _apply(self, fn, recurse=True):
+        module = super()._apply(fn, recurse)
+        for name in (
+            "_full_target_weight_param",
+            "_full_target_bias_param",
+        ):
+            parameter = self.__dict__.get(name)
+            if not isinstance(parameter, nn.Parameter):
+                continue
+            with torch.no_grad():
+                transformed = fn(parameter)
+            parameter.data = transformed.data
+            if parameter.grad is not None:
+                with torch.no_grad():
+                    parameter.grad = fn(parameter.grad)
+        return module
 
     def apply_to(self, **kwargs):
-        self.org_forward = self.org_module[0].forward
-        self.org_module[0].forward = self.forward
-        self.weight.data.add_(self.org_module[0].weight.data)
-        self._org_weight = [self.org_module[0].weight.data.cpu().clone()]
-        delattr(self.org_module[0], "weight")
-        if self.org_module[0].bias is not None:
-            self.bias.data.add_(self.org_module[0].bias.data)
-            self.org_bias = [self.org_module[0].bias.data.cpu().clone()]
-            delattr(self.org_module[0], "bias")
-        else:
-            self.org_bias = None
-        self.is_diff = False
+        module = self.org_module[0]
+        wrappers = list(getattr(module, "_lycoris_wrappers", []))
+        if self in wrappers:
+            return
+        if wrappers:
+            raise RuntimeError(
+                "FullModule cannot be stacked with another adapter on the same target."
+            )
+        if getattr(module, "_lycoris_lokr_merge_entries", {}):
+            raise RuntimeError(
+                "FullModule cannot be applied while a reversible LoKr merge "
+                "is active on the target."
+            )
+        if any(
+            name in module.__dict__
+            for name in (
+                "_lycoris_precise_weight_base",
+                "_lycoris_precise_weight_current",
+                "_lycoris_precise_bias_base",
+                "_lycoris_precise_bias_current",
+            )
+        ):
+            raise RuntimeError(
+                "Finalize the target's precise merge before applying FullModule."
+            )
+
+        if tuple(module.weight.shape) != tuple(self.weight.shape):
+            raise RuntimeError(
+                "The target weight shape changed after FullModule was created."
+            )
+        if (module.bias is not None) != (self.org_bias is not None):
+            raise RuntimeError(
+                "The target bias structure changed after FullModule was created."
+            )
+
+        target_weight = module.weight
+        target_bias = module.bias
+        weight_snapshot = target_weight.detach().cpu().clone()
+        bias_snapshot = (
+            target_bias.detach().cpu().clone() if target_bias is not None else None
+        )
+        adapter_weight_snapshot = self.weight.detach().cpu().clone()
+        adapter_bias_snapshot = (
+            self.bias.detach().cpu().clone() if self.bias is not None else None
+        )
+        weight_base = target_weight.detach().to(self.weight)
+        bias_base = (
+            target_bias.detach().to(self.bias) if target_bias is not None else None
+        )
+        previous_weight_snapshot = self._org_weight
+        previous_bias_snapshot = self.org_bias
+
+        super().apply_to(**kwargs)
+        weight_removed = False
+        bias_removed = False
+        try:
+            object.__setattr__(self, "_full_target_weight_param", target_weight)
+            object.__setattr__(self, "_full_target_bias_param", target_bias)
+            with torch.no_grad():
+                self.weight.add_(weight_base)
+            self._org_weight = [weight_snapshot]
+            if target_bias is not None:
+                with torch.no_grad():
+                    self.bias.add_(bias_base)
+                self.org_bias = [bias_snapshot]
+            else:
+                self.org_bias = None
+
+            delattr(module, "weight")
+            weight_removed = True
+            if target_bias is not None:
+                delattr(module, "bias")
+                bias_removed = True
+            self.is_diff = False
+        except Exception:
+            if weight_removed:
+                module.weight = target_weight
+            if bias_removed:
+                module.bias = target_bias
+            with torch.no_grad():
+                self.weight.copy_(adapter_weight_snapshot.to(self.weight))
+                if self.bias is not None:
+                    self.bias.copy_(adapter_bias_snapshot.to(self.bias))
+            self._org_weight = previous_weight_snapshot
+            self.org_bias = previous_bias_snapshot
+            self.is_diff = True
+            self.__dict__.pop("_full_target_weight_param", None)
+            self.__dict__.pop("_full_target_bias_param", None)
+            super().restore()
+            raise
 
     def restore(self):
-        self.org_module[0].forward = self.org_forward
-        self.org_module[0].weight = nn.Parameter(self._org_weight[0])
+        module = self.org_module[0]
+        if self not in getattr(module, "_lycoris_wrappers", []):
+            return
+        if hasattr(module, "weight"):
+            raise RuntimeError(
+                "The target weight was replaced while FullModule was active; "
+                "refusing to overwrite the external Parameter."
+            )
+        if self.org_bias is not None and hasattr(module, "bias"):
+            raise RuntimeError(
+                "The target bias was replaced while FullModule was active; "
+                "refusing to overwrite the external Parameter."
+            )
+        with torch.no_grad():
+            self.weight.sub_(self._org_weight[0].to(self.weight))
+            if self.bias is not None and self.org_bias is not None:
+                self.bias.sub_(self.org_bias[0].to(self.bias))
+        self.is_diff = True
+
+        weight_param = self.__dict__.pop("_full_target_weight_param")
+        bias_param = self.__dict__.pop("_full_target_bias_param")
+        module.weight = weight_param
         if self.org_bias is not None:
-            self.org_module[0].bias = nn.Parameter(self.org_bias[0])
+            module.bias = bias_param
+        super().restore()
 
     def custom_state_dict(self):
-        sd = {"diff": self.weight.data.cpu() - self._org_weight[0]}
+        diff = (
+            self.weight.detach().cpu()
+            if self.is_diff
+            else self.weight.detach().cpu() - self._org_weight[0]
+        )
+        sd = {"diff": diff}
         if self.bias is not None:
-            sd["diff_b"] = self.bias.data.cpu() - self.org_bias[0]
+            if self.is_diff or self.org_bias is None:
+                diff_bias = self.bias.detach().cpu()
+            else:
+                diff_bias = self.bias.detach().cpu() - self.org_bias[0]
+            sd["diff_b"] = diff_bias
         return sd
 
     def load_weight_prehook(
@@ -148,16 +278,28 @@ class FullModule(LycorisBaseModule):
             state_dict[f"{prefix}bias"] = diff_bias + self.bias.data.to(diff_bias)
 
     def make_weight(self, scale=1, device=None):
+        use_rank_dropout = bool(self.rank_dropout and self.training)
         drop = (
-            torch.rand(self.dim, device=device) > self.rank_dropout
-            if self.rank_dropout and self.training
-            else 1
+            (torch.rand(self.dim, device=device) > self.rank_dropout).to(
+                self.weight.dtype
+            )
+            if use_rank_dropout
+            else None
         )
-        if drop != 1 or scale != 1 or self.is_diff:
+        if use_rank_dropout or scale != 1 or self.is_diff:
             diff_w, diff_b = self.get_diff_weight(scale, device=device)
-            weight = self.org_weight + diff_w * drop
-            if self.org_bias is not None:
-                bias = self.org_bias + diff_b * drop
+            weight_drop = (
+                drop.view(-1, *[1] * (diff_w.dim() - 1)) if drop is not None else 1
+            )
+            weight = self.org_weight.to(diff_w) + diff_w * weight_drop
+            if self.is_diff and hasattr(self.org_module[0], "bias"):
+                base_bias = self.org_module[0].bias
+            else:
+                base_bias = self.org_bias[0] if self.org_bias is not None else None
+            if base_bias is not None:
+                bias = base_bias.to(diff_b) + diff_b * (drop if drop is not None else 1)
+            elif diff_b is not None:
+                bias = diff_b * (drop if drop is not None else 1)
             else:
                 bias = None
         else:
@@ -171,23 +313,24 @@ class FullModule(LycorisBaseModule):
             if self.bias is not None:
                 diff_b = self.bias * multiplier
             return self.weight * multiplier, diff_b
-        org_weight = self.org_module[0].weight.to(device, dtype=self.weight.dtype)
+        org_weight = self.org_weight.to(device, dtype=self.weight.dtype)
         diff = self.weight.to(device) - org_weight
         diff_b = None
         if shape:
             diff = diff.view(shape)
         if self.bias is not None:
-            org_bias = self.org_module[0].bias.to(device, dtype=self.bias.dtype)
-            diff_b = self.bias.to(device) - org_bias
+            org_bias = self.org_bias[0] if self.org_bias is not None else None
+            diff_b = self.bias.to(device)
+            if org_bias is not None:
+                diff_b = diff_b - org_bias.to(device, dtype=self.bias.dtype)
         if device is not None:
             diff = diff.to(device)
             if self.bias is not None:
                 diff_b = diff_b.to(device)
-        if multiplier != 1:
-            diff = diff * multiplier
-            if diff_b is not None:
-                diff_b = diff_b * multiplier
-        return diff * multiplier, diff_b
+        diff = diff * multiplier
+        if diff_b is not None:
+            diff_b = diff_b * multiplier
+        return diff, diff_b
 
     def get_merged_weight(self, multiplier=1, shape=None, device=None):
         weight, bias = self.make_weight(multiplier, device)
@@ -203,22 +346,16 @@ class FullModule(LycorisBaseModule):
             and self.training
             and torch.rand(1) < self.module_dropout
         ):
-            return self.org_forward(x, *args, **kwargs)
+            bias = self.org_bias[0] if self.org_bias is not None else None
+            return self._weight_forward(
+                x,
+                self._org_weight[0].to(x),
+                None if bias is None else bias.to(x),
+            )
 
-        base = self.org_forward(x, *args, **kwargs)
         weight, bias = self.make_weight(self.multiplier, x.device)
-
-        base_weight = self._current_weight().to(weight.device)
-        delta_weight = weight - base_weight
-
-        org_bias = self._current_bias()
-        if bias is not None:
-            bias = bias.to(x.device)
-
-        if org_bias is not None and bias is not None:
-            delta_bias = bias - org_bias.to(bias.device)
-        else:
-            delta_bias = bias
-
-        delta = self.op(x, weight=delta_weight, bias=delta_bias, **self.kw_dict)
-        return base + delta
+        return self._weight_forward(
+            x,
+            weight.to(x),
+            None if bias is None else bias.to(x),
+        )

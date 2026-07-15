@@ -1,5 +1,9 @@
 from functools import cache
 
+import torch
+
+from ..logging import logger
+
 SUPPORT_QUANT = False
 try:
     from bitsandbytes.nn import LinearNF4, Linear8bitLt, LinearFP4
@@ -56,9 +60,6 @@ except Exception:
         pass
 
 
-from ..logging import logger
-
-
 QuantLinears = (
     Linear8bitLt,
     LinearFP4,
@@ -70,6 +71,69 @@ QuantLinears = (
     QConv2dOpt,
     QLayerNormOpt,
 )
+
+
+def dequantize_module_weight(module):
+    """Return a floating-point view of a supported quantized module weight."""
+    if hasattr(module, "W_q") and callable(getattr(module, "dequantize", None)):
+        return module.dequantize()
+
+    weight = module.weight
+    qweight = getattr(module, "qweight", None)
+    qweight_dequantize = getattr(qweight, "dequantize", None)
+    if qweight is not None and callable(qweight_dequantize):
+        return qweight_dequantize()
+
+    class_name = weight.__class__.__name__
+
+    if class_name == "Params4bit":
+        if weight.quant_state is None:
+            if weight.data.is_floating_point():
+                return weight.data
+            raise RuntimeError(
+                "Cannot dequantize an initialized Params4bit weight without "
+                "quantization state."
+            )
+        import bitsandbytes as bnb
+
+        return bnb.functional.dequantize_4bit(
+            weight.data,
+            weight.quant_state,
+        )
+
+    if class_name == "Int8Params":
+        import bitsandbytes as bnb
+
+        state = getattr(module, "state", None)
+        if state is None:
+            raise ValueError(
+                "Cannot dequantize a bitsandbytes Int8Params weight without "
+                "the owning module state."
+            )
+        if state.SCB is None:
+            state.SCB = weight.SCB
+        if state.SCB is None:
+            if weight.data.is_floating_point():
+                return weight.data
+            raise RuntimeError(
+                "Cannot dequantize an initialized Int8Params weight without row scales."
+            )
+        scale = state.SCB.to(weight.data.device)
+        if hasattr(bnb.functional, "int8_vectorwise_dequant"):
+            return bnb.functional.int8_vectorwise_dequant(
+                weight.data,
+                scale,
+            )
+        return weight.data * scale.view(-1, 1) / 127
+
+    dequantize = getattr(weight, "dequantize", None)
+    if callable(dequantize) and weight.__class__ not in {
+        torch.Tensor,
+        torch.nn.Parameter,
+    }:
+        return dequantize()
+
+    return weight
 
 
 @cache

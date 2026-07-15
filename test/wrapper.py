@@ -1,5 +1,5 @@
+import os
 import unittest
-import re
 
 from itertools import product
 from parameterized import parameterized
@@ -7,9 +7,13 @@ from parameterized import parameterized
 import torch
 import torch.nn as nn
 
-from diffusers import FluxTransformer2DModel
+from lycoris import LycorisNetwork, create_lycoris, create_lycoris_from_weights
 
-from lycoris import create_lycoris, create_lycoris_from_weights, LycorisNetwork
+RUN_FLUX_INTEGRATION = os.environ.get("LYCORIS_RUN_FLUX_INTEGRATION") == "1"
+if RUN_FLUX_INTEGRATION:
+    from diffusers import FluxTransformer2DModel
+else:
+    FluxTransformer2DModel = None
 
 
 def reset_globals():
@@ -206,9 +210,27 @@ class LycorisWrapperTests(unittest.TestCase):
             test_input = torch.randn(1, 16, 8, 8, 8).to(device, dtype)
             test_output = test_net(test_input)
             test_lycoris.restore()
+            lokr_base_state = (
+                {
+                    name: parameter.detach().clone()
+                    for name, parameter in test_net.named_parameters()
+                }
+                if algo == "lokr"
+                else None
+            )
             test_lycoris.merge_to()
 
             state_dict = test_lycoris.state_dict()
+            if algo == "lokr":
+                # A reconstructed DoRA adapter must be compared on the same base.
+                # Leaving LoKr merged here would apply the checkpoint twice; low
+                # precision makes that unintended second normalization observable.
+                test_lycoris.merge_to(-1.0)
+                for name, parameter in test_net.named_parameters():
+                    self.assertTrue(
+                        torch.equal(parameter, lokr_base_state[name]),
+                        f"LoKr reversible merge did not exactly restore {name}.",
+                    )
             test_lycoris_from_weights: LycorisNetwork
             test_lycoris_from_weights, _ = create_lycoris_from_weights(
                 1, None, test_net, state_dict
@@ -392,6 +414,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_target_module_and_module_algo_map(self):
         try:
             transformer = FluxTransformer2DModel.from_config(
@@ -515,6 +541,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_whole_model(self):
         try:
             transformer = FluxTransformer2DModel.from_config(
@@ -665,6 +695,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_fnmatch(self):
         try:
             transformer = FluxTransformer2DModel.from_config(
@@ -763,6 +797,10 @@ class LycorisWrapperTests(unittest.TestCase):
         finally:
             reset_globals()
 
+    @unittest.skipUnless(
+        RUN_FLUX_INTEGRATION,
+        "Set LYCORIS_RUN_FLUX_INTEGRATION=1 to run large Flux tests.",
+    )
     def test_diffusers_models_and_state_dicts_fnmatch_and_exclude(self):
         try:
             transformer = FluxTransformer2DModel.from_config(

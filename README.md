@@ -163,7 +163,13 @@ lycoris_param = lycoris_net.parameters()
 forward_with_lyco = your_model(x)
 ```
 
-You can also layer multiple wrappers on top of the same module. Each call to `apply_to()` stacks a new adapter after the previously attached ones, and invoking `restore()` on a wrapper removes only its contribution while keeping earlier wrappers active. See [example/standalone_example.py](example/standalone_example.py) for an end-to-end demonstration.
+You can also layer compatible wrappers on the same module. Multiple LoKr
+wrappers are supported; additive non-DoRA LoKr can additionally share a target
+with non-DoRA LoCon, LoHa, or T-LoRA. FullModule and base- or order-dependent
+cross-algorithm combinations are rejected. Invoking `restore()` removes only
+that wrapper's forward contribution. See
+[example/standalone_example.py](example/standalone_example.py) for an end-to-end
+demonstration.
 
 For a stacking-specific walkthrough (including selectively removing adapters), see `python example/stacked_wrapper_demo.py --help`.
 
@@ -231,7 +237,23 @@ $ python3 merge.py --help
 usage: merge.py [-h] [--is_v2] [--is_sdxl] [--device DEVICE] [--dtype DTYPE] [--weight WEIGHT] base_model lycoris_model output_name
 ```
 
-**Note**: The `merge_to()` method has an opt-in parameter, `precise` that uses more CPU memory to store an original snapshot of the modified weights, allowing us to restore the original weights exactly when calling `restore()`. This is useful when you want to merge multiple LyCORIS models sequentially to the same base model without accumulating numerical errors in a production environment. See this [model merge example](example/high_precision_merge_demo.py) for context.
+**Note**: `merge_to(..., precise=True)` computes merge updates in float64. LoKr
+keeps a reversible CPU ledger by default because DoRA merges are non-additive;
+undo them with the opposite multiplier. If the merge is permanent, use
+`merge_to(..., reversible=False)` or call `finalize_merge()` afterward to release
+the original-weight snapshot. `restore()` only removes forward wrappers and does
+not undo an already merged weight. Restore forward wrappers, parametrizations,
+and on-the-fly changes before a destructive merge. Finalized or non-reversible
+adapters are committed and cannot be reused. Undo or finalize a reversible
+LoKr ledger before updating that adapter's factors again. If factors or the
+target were changed while the ledger was active, normal undo and finalize fail
+closed. Use `resolve_merge_conflict(strategy="restore_base")` to restore the
+whole target ledger only when the merged target itself is untouched, or
+`strategy="adopt_current"` to keep the exact current target without writing it
+and make all adapters in that ledger terminal. Partial conflict recovery is not
+supported. See the
+[high-precision merge example](example/high_precision_merge_demo.py) for the
+merge/unmerge sequence.
 
 ### Conversion of LoRA, LyCORIS and full models between HCP and sd-webui format
 

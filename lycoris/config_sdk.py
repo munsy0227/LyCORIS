@@ -93,11 +93,18 @@ ALGO_REGISTRY: Dict[str, AlgoSpec] = {
             "factor",
             "dropout",
             "rank_dropout",
+            "rank_dropout_scale",
             "module_dropout",
+            "use_tucker",
             "use_scalar",
+            "decompose_both",
             "full_matrix",
             "weight_decompose",
+            "dora_wd",
             "wd_on_output",
+            "wd_on_out",
+            "bypass_mode",
+            "rs_lora",
             "unbalanced_factorization",
         ),
         notes="Setting dim to a very large value triggers the full-matrix path.",
@@ -201,6 +208,16 @@ class AlgoOverride:
 
     def validate(self) -> None:
         if self.algo is None:
+            supported_args = {
+                option
+                for spec in ALGO_REGISTRY.values()
+                for option in spec.supported_args
+            }
+            for key in self.options:
+                if key not in supported_args:
+                    raise PresetValidationError(
+                        f"Unsupported inherited algorithm option '{key}'."
+                    )
             return
         algo_name = self.algo.lower()
         if algo_name not in ALGO_REGISTRY:

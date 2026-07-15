@@ -1,10 +1,11 @@
 # General LyCORIS wrapper based on kohya-ss/sd-scripts' style
 import os
 import fnmatch
+import math
 import re
 import logging
 
-from typing import Any, List
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -47,9 +48,48 @@ deprecated_arg_dict = {
     "constrain": "constraint",
 }
 
+_BOOL_MODULE_OPTIONS = {
+    "bypass_mode",
+    "decompose_both",
+    "full_matrix",
+    "rank_dropout_scale",
+    "rs_lora",
+    "train_llm_adapter",
+    "train_norm",
+    "unbalanced_factorization",
+    "use_scalar",
+    "use_tucker",
+    "wd_on_out",
+    "weight_decompose",
+}
+
+
+def normalize_module_options(options):
+    """Canonicalize aliases and string booleans in module configuration."""
+    normalized = dict(options)
+    if "dora_wd" in normalized:
+        normalized["weight_decompose"] = normalized.pop("dora_wd")
+    if "wd_on_output" in normalized:
+        normalized["wd_on_out"] = normalized.pop("wd_on_output")
+    for key in _BOOL_MODULE_OPTIONS & normalized.keys():
+        if isinstance(normalized[key], str):
+            normalized[key] = str_bool(normalized[key])
+    return normalized
+
+
+def merge_module_options(root_options, local_options):
+    root = normalize_module_options(root_options)
+    local = normalize_module_options(local_options)
+    return {**root, **local}
+
 
 def create_lycoris(
-    module, multiplier=1.0, linear_dim=4, linear_alpha=1, warn_on_unmatched=True, **kwargs
+    module,
+    multiplier=1.0,
+    linear_dim=4,
+    linear_alpha=1,
+    warn_on_unmatched=True,
+    **kwargs,
 ):
     for key, value in list(kwargs.items()):
         if key in deprecated_arg_dict:
@@ -77,10 +117,15 @@ def create_lycoris(
     train_norm = str_bool(kwargs.get("train_norm", False))
     constraint = float(kwargs.get("constraint", 0) or 0)
     rescaled = str_bool(kwargs.get("rescaled", False))
-    weight_decompose = str_bool(kwargs.get("dora_wd", False))
-    wd_on_output = str_bool(kwargs.get("wd_on_output", True))
+    weight_decompose = str_bool(
+        kwargs.get("dora_wd", kwargs.get("weight_decompose", False))
+    )
+    wd_on_output = str_bool(kwargs.get("wd_on_output", kwargs.get("wd_on_out", True)))
     full_matrix = str_bool(kwargs.get("full_matrix", False))
     bypass_mode = str_bool(kwargs.get("bypass_mode", False))
+    rs_lora = str_bool(kwargs.get("rs_lora", False))
+    rank_dropout_scale = str_bool(kwargs.get("rank_dropout_scale", False))
+    decompose_both = str_bool(kwargs.get("decompose_both", False))
     unbalanced_factorization = str_bool(kwargs.get("unbalanced_factorization", False))
     train_llm_adapter = str_bool(kwargs.get("train_llm_adapter", False))
 
@@ -120,8 +165,9 @@ def create_lycoris(
         use_scalar=use_scalar,
         network_module=algo,
         train_norm=train_norm,
-        decompose_both=kwargs.get("decompose_both", False),
+        decompose_both=decompose_both,
         factor=kwargs.get("factor", -1),
+        rank_dropout_scale=rank_dropout_scale,
         block_size=block_size,
         constraint=constraint,
         rescaled=rescaled,
@@ -129,6 +175,7 @@ def create_lycoris(
         wd_on_out=wd_on_output,
         full_matrix=full_matrix,
         bypass_mode=bypass_mode,
+        rs_lora=rs_lora,
         unbalanced_factorization=unbalanced_factorization,
         warn_on_unmatched=warn_on_unmatched,
         train_llm_adapter=train_llm_adapter,
@@ -250,7 +297,11 @@ class LycorisNetwork(torch.nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        root_kwargs = kwargs
+        root_kwargs = normalize_module_options(kwargs)
+        dropout = float(dropout)
+        rank_dropout = float(rank_dropout)
+        module_dropout = float(module_dropout)
+        train_norm = str_bool(train_norm) if isinstance(train_norm, str) else train_norm
         self.weights_sd = None
         if init_only:
             self.multiplier = 1
@@ -267,7 +318,11 @@ class LycorisNetwork(torch.nn.Module):
             return
         self.multiplier = multiplier
         self.lora_dim = lora_dim
-        self.train_llm_adapter = train_llm_adapter
+        self.train_llm_adapter = (
+            str_bool(train_llm_adapter)
+            if isinstance(train_llm_adapter, str)
+            else train_llm_adapter
+        )
 
         if not self.ENABLE_CONV:
             conv_lora_dim = 0
@@ -291,7 +346,9 @@ class LycorisNetwork(torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
 
-        self.use_tucker = use_tucker
+        self.use_tucker = (
+            str_bool(use_tucker) if isinstance(use_tucker, str) else use_tucker
+        )
 
         def create_single_module(
             lora_name: str,
@@ -299,23 +356,36 @@ class LycorisNetwork(torch.nn.Module):
             algo_name,
             dim=None,
             alpha=None,
-            use_tucker=self.use_tucker,
+            use_tucker=None,
             **kwargs,
         ):
-            for k, v in root_kwargs.items():
-                if k in kwargs:
-                    continue
-                kwargs[k] = v
+            local_options = dict(kwargs)
+            if use_tucker is not None:
+                local_options["use_tucker"] = use_tucker
+            kwargs = merge_module_options(root_kwargs, local_options)
+            use_tucker = kwargs.pop("use_tucker", self.use_tucker)
+            configured_dim = kwargs.pop("dim", None)
+            configured_alpha = kwargs.pop("alpha", None)
+            dim = dim if dim is not None else configured_dim
+            alpha = alpha if alpha is not None else configured_alpha
+            kwargs.pop("algo", None)
+            adapter_dropout = float(kwargs.pop("dropout", self.dropout))
+            adapter_rank_dropout = float(kwargs.pop("rank_dropout", self.rank_dropout))
+            adapter_module_dropout = float(
+                kwargs.pop("module_dropout", self.module_dropout)
+            )
 
             if train_norm and "Norm" in module.__class__.__name__:
                 return norm_modules(
                     lora_name,
                     module,
                     self.multiplier,
-                    self.rank_dropout,
-                    self.module_dropout,
+                    adapter_rank_dropout,
+                    adapter_module_dropout,
                     **kwargs,
                 )
+            if dim is not None and dim == 0:
+                return None
             lora = None
             if isinstance(module, torch.nn.Linear) and lora_dim > 0:
                 dim = dim or lora_dim
@@ -340,9 +410,9 @@ class LycorisNetwork(torch.nn.Module):
                 self.multiplier,
                 dim,
                 alpha,
-                self.dropout,
-                self.rank_dropout,
-                self.module_dropout,
+                adapter_dropout,
+                adapter_rank_dropout,
+                adapter_module_dropout,
                 use_tucker,
                 **kwargs,
             )
@@ -533,9 +603,9 @@ class LycorisNetwork(torch.nn.Module):
         # multiple times.
         names = set()
         for lora in self.loras:
-            assert (
-                lora.lora_name not in names
-            ), f"duplicated lora name: {lora.lora_name}"
+            assert lora.lora_name not in names, (
+                f"duplicated lora name: {lora.lora_name}"
+            )
             names.add(lora.lora_name)
 
     def match_fn(self, pattern: str, name: str) -> bool:
@@ -563,7 +633,7 @@ class LycorisNetwork(torch.nn.Module):
 
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import load_file, safe_open
+            from safetensors.torch import load_file
 
             self.weights_sd = load_file(file)
         else:
@@ -596,16 +666,275 @@ class LycorisNetwork(torch.nn.Module):
         for lora in self.loras:
             lora.restore()
 
-    def merge_to(self, weight=1.0, *, precise: bool = False):
+    def merge_to(
+        self,
+        weight=1.0,
+        *,
+        precise: bool = False,
+        reversible: bool = True,
+    ):
+        merge_weight = float(weight)
+        if not math.isfinite(merge_weight):
+            raise ValueError(f"Merge weight must be finite, got {merge_weight}.")
+        target_adapters = {}
         for lora in self.loras:
-            lora.merge_to(weight, precise=precise)
+            target_adapters.setdefault(id(lora.org_module[0]), []).append(lora)
+        for adapters in target_adapters.values():
+            target = adapters[0].org_module[0]
+            if getattr(target, "_lycoris_wrappers", []):
+                raise RuntimeError(
+                    "Restore all forward adapters before merging a network "
+                    "into its target weights."
+                )
+            if getattr(target, "_lycoris_onfly_stack", []):
+                raise RuntimeError(
+                    "Restore the target's on-the-fly merge stack before a "
+                    "permanent network merge."
+                )
+            has_lokr_ledger = bool(getattr(target, "_lycoris_lokr_merge_entries", {}))
+            has_precise_state = any(
+                name in target.__dict__
+                for name in (
+                    "_lycoris_precise_weight_base",
+                    "_lycoris_precise_weight_current",
+                    "_lycoris_precise_bias_base",
+                    "_lycoris_precise_bias_current",
+                )
+            )
+            for adapter in adapters:
+                if getattr(adapter, "not_supported", False):
+                    continue
+                if getattr(adapter, "_lycoris_is_parametrization", False):
+                    raise RuntimeError(
+                        "A network merge cannot destructively merge an active "
+                        "parametrization adapter."
+                    )
+                if getattr(adapter, "name", None) == "kron":
+                    if getattr(adapter, "_lokr_merge_committed", False):
+                        raise RuntimeError(
+                            "A LoKr adapter in this network was already committed."
+                        )
+                    if merge_weight != 0 and getattr(adapter, "is_quant", False):
+                        raise NotImplementedError(
+                            "Merging LoKr into a quantized base weight requires "
+                            "explicit requantization support."
+                        )
+                    if has_precise_state and not has_lokr_ledger:
+                        raise RuntimeError(
+                            "Cannot merge LoKr while a different adapter has an "
+                            "active precise-merge snapshot."
+                        )
+                    if has_lokr_ledger:
+                        adapter._validate_merge_ledger(target, target.weight)
+                        if not reversible:
+                            raise RuntimeError(
+                                "Finalize or fully undo the active reversible "
+                                "LoKr merge before a non-reversible merge."
+                            )
+                elif has_lokr_ledger:
+                    raise RuntimeError(
+                        "Cannot merge a different adapter while a reversible "
+                        "LoKr merge is active on the target."
+                    )
+        if reversible:
+            for adapters in target_adapters.values():
+                names = {getattr(adapter, "name", None) for adapter in adapters}
+                if "kron" in names and names != {"kron"}:
+                    raise RuntimeError(
+                        "A reversible network merge cannot mix LoKr and a "
+                        "different adapter on the same target. Use a "
+                        "non-reversible merge after restoring all wrappers."
+                    )
+
+        merge_sequence = list(self.loras)
+        if not reversible:
+            for target_id, adapters in target_adapters.items():
+                lokr_adapters = [
+                    adapter
+                    for adapter in adapters
+                    if getattr(adapter, "name", None) == "kron"
+                ]
+                if len(lokr_adapters) < 2 or not all(
+                    hasattr(adapter, "_lokr_application_order")
+                    for adapter in lokr_adapters
+                ):
+                    continue
+                lokr_adapters.sort(key=lambda adapter: adapter._lokr_application_order)
+                positions = [
+                    index
+                    for index, adapter in enumerate(merge_sequence)
+                    if id(adapter.org_module[0]) == target_id
+                    and getattr(adapter, "name", None) == "kron"
+                ]
+                for index, adapter in zip(positions, lokr_adapters):
+                    merge_sequence[index] = adapter
+
+        for lora in merge_sequence:
+            lora.merge_to(
+                weight,
+                precise=precise,
+                reversible=reversible,
+            )
+
+    def finalize_merge(self):
+        targets = {id(lora.org_module[0]): lora.org_module[0] for lora in self.loras}
+        for target in targets.values():
+            lokr_entries = getattr(target, "_lycoris_lokr_merge_entries", {})
+            has_lokr_ledger = bool(lokr_entries)
+            has_precise_state = any(
+                name in target.__dict__
+                for name in (
+                    "_lycoris_precise_weight_base",
+                    "_lycoris_precise_weight_current",
+                    "_lycoris_precise_bias_base",
+                    "_lycoris_precise_bias_current",
+                )
+            )
+            if has_lokr_ledger and has_precise_state:
+                raise RuntimeError(
+                    "Cannot finalize overlapping LoKr and different-adapter "
+                    "precise merge states; fully undo LoKr first."
+                )
+            if has_lokr_ledger:
+                ledger_adapter = next(iter(lokr_entries))
+                ledger_adapter._validate_merge_ledger(target, target.weight)
+        for lora in self.loras:
+            lora.finalize_merge()
 
     def onfly_merge(self, weight=1.0):
+        merge_weight = float(weight)
+        if not math.isfinite(merge_weight):
+            raise ValueError(
+                f"On-the-fly merge weight must be finite, got {merge_weight}."
+            )
+        target_adapters = {}
         for lora in self.loras:
-            lora.onfly_merge(weight)
+            target_adapters.setdefault(id(lora.org_module[0]), []).append(lora)
+        for adapters in target_adapters.values():
+            target = adapters[0].org_module[0]
+            if getattr(target, "_lycoris_wrappers", []):
+                raise RuntimeError(
+                    "Restore all forward adapters before an on-the-fly network merge."
+                )
+            if getattr(target, "_lycoris_onfly_stack", []):
+                raise RuntimeError(
+                    "Restore the target's existing on-the-fly merge stack "
+                    "before merging a network."
+                )
+            if getattr(target, "_lycoris_lokr_merge_entries", {}):
+                raise RuntimeError(
+                    "Cannot use a network on-the-fly merge while a reversible "
+                    "LoKr merge is active."
+                )
+            names = {getattr(adapter, "name", None) for adapter in adapters}
+            if "kron" in names and names != {"kron"}:
+                raise RuntimeError(
+                    "A network on-the-fly merge cannot mix LoKr and a "
+                    "different adapter on the same target."
+                )
+            for adapter in adapters:
+                if getattr(adapter, "not_supported", False):
+                    continue
+                if getattr(adapter, "_lycoris_is_parametrization", False):
+                    raise RuntimeError(
+                        "A parametrization adapter cannot be merged "
+                        "on-the-fly while it is active."
+                    )
+                if getattr(adapter, "_lycoris_onfly_active", False) or hasattr(
+                    adapter,
+                    "_lokr_onfly_multiplier",
+                ):
+                    raise RuntimeError(
+                        "An adapter in this network already has an active "
+                        "on-the-fly merge."
+                    )
+                if getattr(adapter, "name", None) == "kron":
+                    if getattr(adapter, "_lokr_merge_committed", False):
+                        raise RuntimeError(
+                            "A LoKr adapter in this network was already committed."
+                        )
+                    if merge_weight != 0 and getattr(adapter, "is_quant", False):
+                        raise NotImplementedError(
+                            "On-the-fly LoKr merging into a quantized base weight "
+                            "requires explicit requantization support."
+                        )
 
+        merged = []
+        try:
+            for lora in self.loras:
+                lora.onfly_merge(weight)
+                merged.append(lora)
+        except Exception:
+            rollback_error = None
+            for lora in reversed(merged):
+                try:
+                    lora.onfly_restore()
+                except Exception as restore_error:  # pragma: no cover - defensive
+                    rollback_error = restore_error
+                    break
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Network on-the-fly merge failed and rollback could not "
+                    "restore every previously merged adapter."
+                ) from rollback_error
+            raise
+
+    @torch.no_grad()
     def onfly_restore(self):
-        for lora in self.loras:
+        simulated_stacks = {}
+        validated_targets = set()
+        for lora in reversed(self.loras):
+            if getattr(lora, "not_supported", False):
+                continue
+            target = lora.org_module[0]
+            target_id = id(target)
+            stack = simulated_stacks.setdefault(
+                target_id,
+                list(getattr(target, "_lycoris_onfly_stack", [])),
+            )
+            if getattr(lora, "name", None) == "kron":
+                if not hasattr(lora, "_lokr_onfly_multiplier"):
+                    raise RuntimeError("onfly_restore() called without onfly_merge().")
+            elif not hasattr(lora, "_lycoris_onfly_active"):
+                raise RuntimeError("onfly_restore() called without onfly_merge().")
+            if not stack or stack[-1].get("adapter") is not lora:
+                raise RuntimeError(
+                    "Network on-the-fly adapters must be restored in reverse "
+                    "merge order."
+                )
+
+            if target_id not in validated_targets:
+                frame = stack[-1]
+                if frame.get("kind") == "lokr":
+                    frame["adapter"]._validate_onfly_stack(target, stack)
+                else:
+                    if target.weight is not frame["weight_param"]:
+                        raise RuntimeError(
+                            "The target weight Parameter was replaced during "
+                            "an on-the-fly merge; refusing partial restore."
+                        )
+                    if target.weight._version != frame["weight_version"]:
+                        raise RuntimeError(
+                            "The target weight changed during an on-the-fly "
+                            "merge; refusing partial restore."
+                        )
+                    if target.bias is not frame["bias_param"]:
+                        raise RuntimeError(
+                            "The target bias Parameter was replaced during an "
+                            "on-the-fly merge; refusing partial restore."
+                        )
+                    if (
+                        target.bias is not None
+                        and target.bias._version != frame["bias_version"]
+                    ):
+                        raise RuntimeError(
+                            "The target bias changed during an on-the-fly "
+                            "merge; refusing partial restore."
+                        )
+                validated_targets.add(target_id)
+            stack.pop()
+
+        for lora in reversed(self.loras):
             lora.onfly_restore()
 
     def apply_max_norm_regularization(self, max_norm_value, device):
@@ -662,11 +991,14 @@ class LycorisNetwork(torch.nn.Module):
             metadata = None
 
         state_dict = self.state_dict()
+        LokrModule.strip_training_state_keys(state_dict)
 
         if dtype is not None:
+            master_dtype_keys = LokrModule.export_master_dtype_keys(state_dict)
             for key in list(state_dict.keys()):
                 v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                target_dtype = v.dtype if key in master_dtype_keys else dtype
+                v = v.detach().clone().to("cpu").to(target_dtype)
                 state_dict[key] = v
 
         if os.path.splitext(file)[1] == ".safetensors":

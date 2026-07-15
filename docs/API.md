@@ -20,6 +20,10 @@
   * `apply_to`
   * `restore`
   * `merge_to`
+  * `finalize_merge`
+  * `resolve_merge_conflict` (LoKr only)
+  * `onfly_merge`
+  * `onfly_restore`
   * `get_diff_weight`
   * `get_merged_weight`
   * `apply_max_norm`
@@ -49,7 +53,7 @@
 For each modules, we have 3 basic methods:
 
 * `weight_gen`: Generate weights for corresponding algorithm
-* `weight_diff`: calculate $\Delta W$
+* `diff_weight`: calculate $\Delta W$
 * `bypass_forward_diff`: calculate $\Delta W X$
 
 There are some other utilities:
@@ -68,17 +72,18 @@ For all the functional API, you can directly use any kind of them with following
 
 ```python
 from lycoris.functional import xxx
-weights = xxx.weight_gen(org_weight)
+weights = xxx.weight_gen(org_weight, rank=4)
 
 def forward_with_diff_weight(x, org_weight, weights):
-    return org_forward(x, org_weight + xxx.weight_diff(*weights))
+    return org_forward(x, org_weight + xxx.diff_weight(*weights))
 
 def forward_with_diff_activation(x, org_weight, weights):
     org_out = org_forward(x, org_weight)
     return org_out + xxx.bypass_forward_diff(x, org_out, *weights)
 ```
 
-Although different algorithm will have different extra arguments for weight_diff and bypass_forward_diff, the overall logic is same.
+Although different algorithms have different extra arguments for `diff_weight`
+and `bypass_forward_diff`, the overall logic is the same.
 
 ## Others
 
@@ -88,10 +93,88 @@ Although different algorithm will have different extra arguments for weight_diff
 * `create_lycoris`: see example
 * `create_lycoris_from_weights`: see example
 
-`LycorisNetwork.apply_to()` can be invoked multiple times on the same module with different wrapper instances. Each wrapper is stacked on top of the previous one, and calling `restore()` on a wrapper removes only its own contribution while keeping earlier wrappers active.
+For LoKr modules created with `use_scalar=True`, `network.state_dict()` preserves
+the exact LoKr adapter parameterization needed for training resume. Optimizer,
+scheduler, RNG, and other trainer state must still be checkpointed separately.
+In addition to the historical scalar-folded first factor, the adapter state
+contains versioned `_lycoris_lokr_training_*` entries for the raw first factor
+and trainable scalar. This preserves the initial `scalar=0` state and
+optimizer-compatible parameterization exactly. Factory reconstruction detects
+these entries and restores `use_scalar=True` automatically. When loading the
+state directly into a preconstructed module, that module must also use
+`use_scalar=True`; a mismatch is rejected instead of silently changing the
+optimizer parameter set.
+
+`LycorisNetwork.save_weights()` and `LycorisNetworkKohya.save_weights()` remove
+those resume-only entries and write the portable historical representation.
+Requested low save precision applies to LoKr factors, while `dora_scale` keeps
+its master dtype and `dora_zero_mask` remains boolean; these tensors are small
+and quantizing them would break the initial DoRA no-op or structural mask.
+When saving `state_dict()` directly for inference or interchange, call
+`LokrModule.strip_training_state_keys(state_dict)` first. Conversely, do not
+strip an Accelerate/PyTorch training checkpoint that must resume exactly. With
+`load_state_dict(assign=True)`, create the optimizer after loading, as required
+by the normal PyTorch Parameter-replacement contract.
+
+`LycorisNetwork.apply_to()` can be invoked multiple times with different wrapper
+instances. Multiple LoKr wrappers may share a target. An additive, non-DoRA
+LoKr may also share a target with non-DoRA LoCon, LoHa, or T-LoRA. FullModule
+is exclusive, and base- or order-dependent cross-algorithm combinations are
+rejected. Calling `restore()` removes only that wrapper's forward contribution.
+
+LoKr uses a reversible merge ledger by default so non-additive DoRA composition
+can be undone exactly with the opposite multiplier. This keeps one CPU copy of
+the original target weight. Use `merge_to(..., reversible=False)` when the merge
+will never be undone, or call `finalize_merge()` after a reversible merge, to
+keep the current weight and release that ledger. A finalized or non-reversible
+DoRA merge cannot be recovered by applying a negative multiplier, and the
+committed adapter cannot be applied or merged again. Restore all forward
+wrappers, remove active parametrizations, and restore on-the-fly changes before
+a destructive merge. A reversible network merge rejects mixed LoKr and other
+algorithms on one target. Do not train or otherwise mutate LoKr factors while a
+reversible merge ledger is active; normal partial undo and finalize operations
+fail closed if a factor or the target weight changes. Resolve such a conflict
+for the complete target ledger with exactly one explicit outcome:
+
+```python
+adapter.resolve_merge_conflict(strategy="restore_base")
+adapter.resolve_merge_conflict(strategy="adopt_current")
+```
+
+`restore_base` is available only when the target `Parameter` identity and its
+exact merged bytes are unchanged; it restores the original base and leaves the
+updated factors reusable. `adopt_current` never writes the target, keeps any
+current or externally replaced target exactly as-is, and makes every adapter in
+that target ledger terminal. Conflict recovery is intentionally target-wide:
+an old partial composition cannot be reconstructed from changed factors without
+retaining another potentially weight-sized recipe.
+
+`onfly_restore()` must run in reverse order when multiple adapters temporarily
+modify the same target. `LycorisNetwork.onfly_restore()` performs this reversal
+automatically. The stack is shared by adapters on the target; mixing LoKr and a
+different algorithm in that stack is rejected. Network operations preflight
+all targets and roll back completed on-the-fly operations after a later
+failure. Both permanent and on-the-fly LoKr paths reject untracked target-weight
+changes instead of overwriting them.
 
 See `example/stacked_wrapper_demo.py` for a script that showcases stacking and selective removal in practice.
 
 ### kohya
 
 * the specialized wrapper for kohya-ss/sd-scripts.
+
+Optimizer preparation freezes adapters omitted by an effective zero learning
+rate and keeps that mask through `prepare_grad_etc()`, including calls made
+before adapters are registered as network children. Supported LoRA+ higher-LR
+roles are `lora_up` and `hada_w2_a`. LoKr parameters remain in the base-LR group:
+its full, Kronecker, and Tucker representations do not have one validated
+equivalent of LoRA's two-factor B matrix. Optimizers used with a non-unit LoRA+
+ratio must support different nonzero learning rates across parameter groups.
+Rebuild the optimizer after changing the effective adapter topology or
+learning-rate groups.
+
+The text-encoder/U-Net selection passed to Kohya `apply_to()` is immutable after
+the first successful call. Repeating the same selection while active is a no-op,
+and the same selection can be applied again after `restore()`. Changing the
+selection later is rejected before any wrapper or module-list mutation; create a
+new network for a different topology.

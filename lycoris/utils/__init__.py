@@ -7,13 +7,12 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.linalg as linalg
 
 import safetensors.torch
 
 from tqdm import tqdm
-from .general import *
+from .general import *  # noqa: F403
 
 
 def load_bytes_in_safetensors(tensors):
@@ -334,7 +333,7 @@ def extract_diff(
 
     for idx, (te1, te2) in enumerate(zip(base_tes, db_tes)):
         if len(base_tes) > 1:
-            prefix = f"{LORA_PREFIX_TEXT_ENCODER}{idx+1}"
+            prefix = f"{LORA_PREFIX_TEXT_ENCODER}{idx + 1}"
         else:
             prefix = LORA_PREFIX_TEXT_ENCODER
         all_loras |= make_state_dict(
@@ -444,7 +443,9 @@ def merge(tes, unet, lyco_state_dict, scale: float = 1.0, device="cpu"):
             if module is None:
                 continue
             module.to(device)
-            module.merge_to(scale)
+            # Checkpoint conversion is permanent; retaining one reversible
+            # base-weight snapshot per target would double host memory.
+            module.merge_to(scale, reversible=False)
             key_dict.pop(convert_diffusers_name_to_compvis(lora_name), None)
             key_dict.pop(lora_name, None)
             merged += 1

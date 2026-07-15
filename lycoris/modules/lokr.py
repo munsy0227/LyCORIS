@@ -1,5 +1,7 @@
+import hashlib
 import math
 import operator
+import weakref
 from contextvars import ContextVar
 from functools import cache
 
@@ -18,6 +20,13 @@ from ..logging import logger
 
 
 _lokr_forward_weights = ContextVar("lokr_forward_weights", default=None)
+_MERGE_FINGERPRINT_CHUNK_BYTES = 1024 * 1024
+_TRAINING_STATE_PREFIX = "_lycoris_lokr_training_"
+_TRAINING_STATE_VERSION = 1
+_TRAINING_STATE_VERSION_KEY = f"{_TRAINING_STATE_PREFIX}version"
+_TRAINING_STATE_SCALAR_KEY = f"{_TRAINING_STATE_PREFIX}scalar"
+_TRAINING_STATE_W1_KEY = f"{_TRAINING_STATE_PREFIX}unfolded_w1"
+_TRAINING_STATE_W1_A_KEY = f"{_TRAINING_STATE_PREFIX}unfolded_w1_a"
 
 
 @cache
@@ -54,6 +63,11 @@ class LokrModule(LycorisBaseModule):
         "alpha",
         "dora_scale",
         "lokr_residual_scale",
+        "dora_zero_mask",
+        _TRAINING_STATE_VERSION_KEY,
+        _TRAINING_STATE_SCALAR_KEY,
+        _TRAINING_STATE_W1_KEY,
+        _TRAINING_STATE_W1_A_KEY,
     ]
     weight_list_det = ["lokr_w1", "lokr_w1_a"]
 
@@ -79,6 +93,7 @@ class LokrModule(LycorisBaseModule):
         rs_lora=False,
         unbalanced_factorization=False,
         _dora_scale=None,
+        _dora_zero_mask=None,
         **kwargs,
     ):
         try:
@@ -220,6 +235,11 @@ class LokrModule(LycorisBaseModule):
                 self.use_w2 = True
                 self.lokr_w2 = nn.Parameter(torch.empty(shape[0][1], shape[1][1]))
 
+        # ``full_matrix`` describes the representation that was actually
+        # selected, not only whether it was explicitly requested.  A large
+        # lora_dim can promote both factors to full matrices automatically.
+        self.full_matrix = self.use_w1 and self.use_w2
+
         self.wd = weight_decompose
         self.wd_on_out = wd_on_out
         if self.wd:
@@ -228,24 +248,50 @@ class LokrModule(LycorisBaseModule):
             self.bypass_mode = False
 
             self.dora_norm_dims = len(self.shape) - 1
+            org_weight = self._current_weight()
+            if org_weight.is_meta and _dora_scale is None:
+                raise RuntimeError(
+                    "LoKr DoRA requires a materialized base weight to initialize "
+                    "its magnitude."
+                )
+            if tuple(org_weight.shape) != self.shape:
+                raise ValueError(
+                    "Dequantized base weight shape does not match the target "
+                    f"module: expected {self.shape}, got {tuple(org_weight.shape)}."
+                )
+            initial_magnitude = (
+                None
+                if org_weight.is_meta
+                else self._initial_dora_magnitude(org_module, org_weight)
+            )
             if _dora_scale is not None:
                 self._validate_dora_scale_shape(org_module, _dora_scale)
-                self.dora_scale = nn.Parameter(_dora_scale.detach().clone())
+                magnitude_dtype = self._dora_accumulator_dtype(_dora_scale.dtype)
+                magnitude = _dora_scale.detach().to(dtype=magnitude_dtype).clone()
             else:
-                org_weight = self._current_weight()
-                if org_weight.is_meta:
-                    raise RuntimeError(
-                        "LoKr DoRA requires a materialized base weight to initialize "
-                        "its magnitude."
-                    )
-                if tuple(org_weight.shape) != self.shape:
-                    raise ValueError(
-                        "Dequantized base weight shape does not match the target "
-                        f"module: expected {self.shape}, got {tuple(org_weight.shape)}."
-                    )
-                magnitude = self._initial_dora_magnitude(org_module, org_weight)
                 adapter_device = next(self.parameters()).device
-                self.dora_scale = nn.Parameter(magnitude.to(adapter_device))
+                magnitude = initial_magnitude.to(adapter_device)
+            self.dora_scale = nn.Parameter(magnitude)
+
+            if _dora_zero_mask is None:
+                zero_mask = (
+                    torch.zeros_like(magnitude, dtype=torch.bool)
+                    if initial_magnitude is None
+                    else initial_magnitude == 0
+                )
+                self._dora_zero_mask_pending = initial_magnitude is None
+            else:
+                self._validate_dora_zero_mask(
+                    org_module,
+                    _dora_zero_mask,
+                    magnitude,
+                )
+                zero_mask = _dora_zero_mask.detach().to(dtype=torch.bool)
+                self._dora_zero_mask_pending = False
+            self.register_buffer(
+                "dora_zero_mask",
+                zero_mask.to(device=self.dora_scale.device),
+            )
 
         self.dropout = dropout
         self.rank_dropout = rank_dropout
@@ -263,7 +309,7 @@ class LokrModule(LycorisBaseModule):
             raise TypeError(f"alpha must be a finite number, got {alpha!r}.") from error
         if not math.isfinite(alpha):
             raise ValueError(f"alpha must be finite, got {alpha}.")
-        uses_full_weight_matrices = self.use_w2 and self.use_w1
+        uses_full_weight_matrices = self.full_matrix
         if uses_full_weight_matrices:
             # use scale = 1
             alpha = lora_dim
@@ -305,6 +351,48 @@ class LokrModule(LycorisBaseModule):
             torch.nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
             torch.nn.init.kaiming_uniform_(self.lokr_w1_b, a=math.sqrt(5))
 
+    def _apply(self, fn, recurse=True):
+        # DoRA norms are accumulated in float32 for fp16/bf16 targets.  Keep the
+        # trainable magnitude in that same master precision when the rest of a
+        # network is cast for full low-precision training.  Wrap the conversion
+        # itself instead of restoring data afterwards: cross-device meta moves
+        # cannot accept set_data(), and to_empty() must retain its empty-storage
+        # semantics.  PyTorch's normal Module._apply lifecycle still preserves
+        # the Parameter object for ordinary .to() calls, as required when an
+        # optimizer was constructed before the cast.
+        dora_parameter = getattr(self, "dora_scale", None)
+        if not isinstance(dora_parameter, nn.Parameter) or dora_parameter.is_meta:
+            return super()._apply(fn, recurse)
+        dora_gradient = dora_parameter.grad
+
+        def preserve_dora_master(tensor):
+            transformed = fn(tensor)
+            if tensor is not dora_parameter and tensor is not dora_gradient:
+                return transformed
+            if transformed.is_meta or transformed.dtype not in {
+                torch.float16,
+                torch.bfloat16,
+            }:
+                return transformed
+            master_dtype = self._dora_accumulator_dtype(tensor.dtype)
+            return tensor.to(device=transformed.device, dtype=master_dtype)
+
+        module = super()._apply(preserve_dora_master, recurse)
+        transformed_parameter = self.dora_scale
+        if (
+            transformed_parameter is not dora_parameter
+            and not transformed_parameter.is_meta
+        ):
+            # ``overwrite_module_params_on_conversion`` may ask PyTorch to
+            # replace Parameters during .to().  Reattach the original object so
+            # an optimizer created before the cast cannot retain a stale DoRA
+            # magnitude reference.  Using the already transformed tensor also
+            # preserves to_empty() semantics.
+            dora_parameter.data = transformed_parameter.detach()
+            dora_parameter.grad = transformed_parameter.grad
+            self._parameters["dora_scale"] = dora_parameter
+        return module
+
     @classmethod
     def _dora_scale_shapes(cls, orig_module):
         weight_shape = cls._target_weight_shape(orig_module)
@@ -345,6 +433,31 @@ class LokrModule(LycorisBaseModule):
                 f"{sorted(valid_shapes)}."
             )
 
+    @classmethod
+    def _validate_dora_zero_mask(
+        cls,
+        orig_module,
+        dora_zero_mask,
+        dora_scale=None,
+    ):
+        if not isinstance(dora_zero_mask, torch.Tensor):
+            raise TypeError("dora_zero_mask must be a Tensor.")
+        valid_shapes = {
+            shape for shape in cls._dora_scale_shapes(orig_module) if shape is not None
+        }
+        mask_shape = tuple(dora_zero_mask.shape)
+        if mask_shape not in valid_shapes:
+            raise ValueError(
+                "Invalid dora_zero_mask shape for target weight: "
+                f"weight={cls._target_weight_shape(orig_module)}, "
+                f"mask={mask_shape}, expected one of {sorted(valid_shapes)}."
+            )
+        if dora_scale is not None and mask_shape != tuple(dora_scale.shape):
+            raise ValueError(
+                "dora_zero_mask must exactly match dora_scale: "
+                f"mask={mask_shape}, dora_scale={tuple(dora_scale.shape)}."
+            )
+
     def _initial_dora_magnitude(self, orig_module, org_weight):
         compute_dtype = self._dora_accumulator_dtype(org_weight.dtype)
         direction = org_weight.to(dtype=compute_dtype)
@@ -376,6 +489,41 @@ class LokrModule(LycorisBaseModule):
             dim=norm_dims,
             keepdim=True,
         )
+
+    @torch.no_grad()
+    def _resolve_dora_zero_mask(self, base_weight):
+        if not getattr(self, "_dora_zero_mask_pending", False):
+            return self.dora_zero_mask
+        if base_weight.is_meta:
+            raise RuntimeError(
+                "LoKr DoRA cannot derive a legacy zero-norm mask from an "
+                "unmaterialized base weight."
+            )
+
+        zero_mask = (
+            self._initial_dora_magnitude(
+                self.org_module[0],
+                base_weight,
+            )
+            == 0
+        )
+        if tuple(zero_mask.shape) != tuple(self.dora_zero_mask.shape):
+            raise RuntimeError(
+                "Derived dora_zero_mask does not match the checkpoint magnitude: "
+                f"mask={tuple(zero_mask.shape)}, "
+                f"dora_scale={tuple(self.dora_scale.shape)}."
+            )
+        if self.dora_zero_mask.is_meta:
+            self.dora_zero_mask = zero_mask.to(
+                device=self.dora_scale.device,
+                dtype=torch.bool,
+            )
+        else:
+            self.dora_zero_mask.copy_(
+                zero_mask.to(device=self.dora_zero_mask.device, dtype=torch.bool)
+            )
+        self._dora_zero_mask_pending = False
+        return self.dora_zero_mask
 
     @classmethod
     def _infer_factorization_config(
@@ -457,6 +605,11 @@ class LokrModule(LycorisBaseModule):
         alpha,
         dora_scale,
         residual_scale=None,
+        dora_zero_mask=None,
+        training_version=None,
+        training_scalar=None,
+        training_w1=None,
+        training_w1_a=None,
     ):
         if w1 is None:
             if w1a is None or w1b is None:
@@ -468,6 +621,71 @@ class LokrModule(LycorisBaseModule):
             raise ValueError(
                 "A LoKr checkpoint cannot mix lokr_w1 with low-rank w1 factors."
             )
+
+        training_values = (
+            training_version,
+            training_scalar,
+            training_w1,
+            training_w1_a,
+        )
+        has_training_state = any(value is not None for value in training_values)
+        if has_training_state:
+            if training_version is None or training_scalar is None:
+                raise ValueError(
+                    "Incomplete LoKr training state: version and scalar are required."
+                )
+            if (
+                not isinstance(training_version, torch.Tensor)
+                or training_version.dim() != 0
+                or training_version.is_meta
+                or training_version.dtype != torch.int64
+                or training_version.item() != _TRAINING_STATE_VERSION
+            ):
+                raise ValueError(
+                    "Unsupported LoKr training state version; expected "
+                    f"a materialized int64 scalar equal to "
+                    f"{_TRAINING_STATE_VERSION}."
+                )
+            if (
+                not isinstance(training_scalar, torch.Tensor)
+                or training_scalar.dim() != 0
+                or training_scalar.is_meta
+                or not training_scalar.is_floating_point()
+            ):
+                raise ValueError(
+                    "LoKr training scalar must be a materialized floating-point "
+                    "scalar tensor."
+                )
+            if w1 is not None:
+                if training_w1 is None or training_w1_a is not None:
+                    raise ValueError(
+                        "Full-factor LoKr training state requires only unfolded_w1."
+                    )
+                if (
+                    not isinstance(training_w1, torch.Tensor)
+                    or training_w1.is_meta
+                    or tuple(training_w1.shape) != tuple(w1.shape)
+                ):
+                    raise ValueError(
+                        "LoKr training unfolded_w1 must match the portable first "
+                        "factor exactly."
+                    )
+                w1 = training_w1
+            else:
+                if training_w1_a is None or training_w1 is not None:
+                    raise ValueError(
+                        "Low-rank LoKr training state requires only unfolded_w1_a."
+                    )
+                if (
+                    not isinstance(training_w1_a, torch.Tensor)
+                    or training_w1_a.is_meta
+                    or tuple(training_w1_a.shape) != tuple(w1a.shape)
+                ):
+                    raise ValueError(
+                        "LoKr training unfolded_w1_a must match the portable first "
+                        "factor exactly."
+                    )
+                w1a = training_w1_a
         if w2 is None:
             if w2a is None or w2b is None:
                 raise ValueError(
@@ -485,6 +703,14 @@ class LokrModule(LycorisBaseModule):
             not isinstance(residual_scale, torch.Tensor) or residual_scale.numel() != 1
         ):
             raise ValueError("lokr_residual_scale must be a scalar tensor.")
+        if dora_zero_mask is not None:
+            if dora_scale is None:
+                raise ValueError("dora_zero_mask requires a dora_scale tensor.")
+            cls._validate_dora_zero_mask(
+                orig_module,
+                dora_zero_mask,
+                dora_scale,
+            )
 
         if w1 is not None:
             if w1.dim() != 2:
@@ -619,7 +845,9 @@ class LokrModule(LycorisBaseModule):
                 wd_on_out=wd_on_out,
                 full_matrix=full_matrix,
                 unbalanced_factorization=unbalanced_factorization,
+                use_scalar=has_training_state,
                 _dora_scale=dora_scale,
+                _dora_zero_mask=dora_zero_mask,
             )
 
         # The checkpoint representation is authoritative. Constructor rank
@@ -664,7 +892,8 @@ class LokrModule(LycorisBaseModule):
         if t2 is not None:
             restore_parameter("lokr_t2", t2)
         if dora_scale is not None:
-            restore_parameter("dora_scale", dora_scale)
+            dora_dtype = cls._dora_accumulator_dtype(dora_scale.dtype)
+            restore_parameter("dora_scale", dora_scale.to(dtype=dora_dtype))
 
         reference = next(
             (
@@ -678,7 +907,10 @@ class LokrModule(LycorisBaseModule):
             raise ValueError(
                 "A LoKr checkpoint must contain at least one materialized factor."
             )
-        module.scalar = reference.new_ones(())
+        if has_training_state:
+            module.scalar = nn.Parameter(training_scalar.detach().clone())
+        else:
+            module.scalar = reference.new_ones(())
         module.dtype_tensor = reference.new_zeros(())
         if residual_scale is not None:
             module.lokr_residual_scale = residual_scale.detach().clone()
@@ -688,7 +920,141 @@ class LokrModule(LycorisBaseModule):
             module.alpha = alpha.detach().clone()
         else:
             module.alpha = reference.new_tensor(alpha)
+
+        # Optimizer state uses positional parameter IDs.  Reconstructing the
+        # authoritative checkpoint representation above removes and re-adds
+        # factors, which would otherwise place them after the already-created
+        # DoRA magnitude and scalar.  Restore the same registration order as a
+        # normally constructed module so a training-state reconstruction can
+        # load its optimizer state without assigning slots to different
+        # parameter shapes.
+        parameter_order = []
+        if module.use_w1:
+            parameter_order.append("lokr_w1")
+        else:
+            parameter_order.extend(("lokr_w1_a", "lokr_w1_b"))
+        if module.use_w2:
+            parameter_order.append("lokr_w2")
+        elif module.tucker:
+            parameter_order.extend(("lokr_t2", "lokr_w2_a", "lokr_w2_b"))
+        else:
+            parameter_order.extend(("lokr_w2_a", "lokr_w2_b"))
+        if module.wd:
+            parameter_order.append("dora_scale")
+        if isinstance(module.scalar, nn.Parameter):
+            parameter_order.append("scalar")
+
+        ordered_parameters = type(module._parameters)()
+        for name in parameter_order:
+            parameter = module._parameters.get(name)
+            if parameter is not None:
+                ordered_parameters[name] = parameter
+        for name, parameter in module._parameters.items():
+            if name not in ordered_parameters:
+                ordered_parameters[name] = parameter
+        module._parameters = ordered_parameters
         return module
+
+    @staticmethod
+    def is_training_state_key(key):
+        """Return whether a network state key is LoKr resume-only data."""
+        return key.rsplit(".", 1)[-1].startswith(_TRAINING_STATE_PREFIX)
+
+    @classmethod
+    def strip_training_state_keys(cls, state_dict):
+        """Remove resume-only entries in place before a portable export."""
+        for key in tuple(state_dict):
+            if cls.is_training_state_key(key):
+                state_dict.pop(key)
+        return state_dict
+
+    @classmethod
+    def export_master_dtype_keys(cls, state_dict):
+        """Return LoKr auxiliary keys that must keep their structural dtype."""
+        lokr_prefixes = {
+            key.rpartition(".")[0]
+            for key in state_dict
+            if key.rpartition(".")[2] in cls.weight_list_det
+        }
+        return {
+            key
+            for key in state_dict
+            if key.rpartition(".")[0] in lokr_prefixes
+            and key.rpartition(".")[2] in {"dora_scale", "dora_zero_mask"}
+        }
+
+    @torch.no_grad()
+    def _consume_training_state(self, state_dict, prefix, local_metadata):
+        version_key = f"{prefix}{_TRAINING_STATE_VERSION_KEY}"
+        scalar_key = f"{prefix}{_TRAINING_STATE_SCALAR_KEY}"
+        raw_w1_key = f"{prefix}{_TRAINING_STATE_W1_KEY}"
+        raw_w1_a_key = f"{prefix}{_TRAINING_STATE_W1_A_KEY}"
+        auxiliary_keys = (version_key, scalar_key, raw_w1_key, raw_w1_a_key)
+        present_keys = {key for key in auxiliary_keys if key in state_dict}
+
+        if not present_keys:
+            return False
+        if version_key not in present_keys:
+            raise RuntimeError(
+                "LoKr training state is missing its format version marker."
+            )
+
+        version = state_dict[version_key]
+        if (
+            not isinstance(version, torch.Tensor)
+            or version.dim() != 0
+            or version.is_meta
+            or version.dtype != torch.int64
+            or version.item() != _TRAINING_STATE_VERSION
+        ):
+            raise RuntimeError(
+                "Unsupported LoKr training state version; expected "
+                f"a materialized int64 scalar equal to "
+                f"{_TRAINING_STATE_VERSION}."
+            )
+
+        if not isinstance(self.scalar, nn.Parameter):
+            raise RuntimeError(
+                "LoKr training state contains a trainable scalar, but the target "
+                "module was created with use_scalar=False. Load a portable "
+                "checkpoint for inference or recreate the training module with "
+                "use_scalar=True."
+            )
+
+        expected_raw_key = raw_w1_key if self.use_w1 else raw_w1_a_key
+        unexpected_raw_key = raw_w1_a_key if self.use_w1 else raw_w1_key
+        missing_keys = [
+            key for key in (scalar_key, expected_raw_key) if key not in present_keys
+        ]
+        if missing_keys or unexpected_raw_key in present_keys:
+            raise RuntimeError(
+                "Incomplete or incompatible LoKr training state for the first "
+                "Kronecker factor."
+            )
+
+        scalar = state_dict[scalar_key]
+        raw_w1 = state_dict[expected_raw_key]
+        if (
+            not isinstance(scalar, torch.Tensor)
+            or scalar.dim() != 0
+            or scalar.is_meta
+            or not scalar.is_floating_point()
+        ):
+            raise RuntimeError(
+                "LoKr training scalar must be a materialized floating-point "
+                "scalar tensor."
+            )
+        if not isinstance(raw_w1, torch.Tensor) or raw_w1.dim() != 2:
+            raise RuntimeError(
+                "LoKr training state must contain an unfolded 2D first factor."
+            )
+
+        for key in auxiliary_keys:
+            state_dict.pop(key, None)
+        factor_name = "lokr_w1" if self.use_w1 else "lokr_w1_a"
+        state_dict[f"{prefix}{factor_name}"] = raw_w1
+        state_dict[f"{prefix}scalar"] = scalar
+        return True
 
     def load_weight_prehook(
         self,
@@ -700,6 +1066,11 @@ class LokrModule(LycorisBaseModule):
         unexpected_keys,
         error_msgs,
     ):
+        has_training_state = self._consume_training_state(
+            state_dict,
+            prefix,
+            local_metadata,
+        )
         factor_keys = (
             "lokr_w1",
             "lokr_w1_a",
@@ -726,19 +1097,70 @@ class LokrModule(LycorisBaseModule):
                 if reference is not None
                 else torch.ones_like(self.lokr_residual_scale)
             )
+        if self.wd:
+            dora_scale_key = f"{prefix}dora_scale"
+            checkpoint_magnitude = state_dict.get(dora_scale_key)
+            if isinstance(checkpoint_magnitude, torch.Tensor):
+                self._validate_dora_scale_shape(
+                    self.org_module[0],
+                    checkpoint_magnitude,
+                )
+                state_dict[dora_scale_key] = checkpoint_magnitude.to(
+                    dtype=self._dora_accumulator_dtype(checkpoint_magnitude.dtype)
+                )
+            zero_mask_key = f"{prefix}dora_zero_mask"
+            if zero_mask_key not in state_dict:
+                base_weight = self._current_weight()
+                if base_weight.is_meta:
+                    state_dict[zero_mask_key] = torch.zeros_like(
+                        self.dora_zero_mask,
+                        dtype=torch.bool,
+                    )
+                    self._dora_zero_mask_pending = True
+                else:
+                    derived_mask = (
+                        self._initial_dora_magnitude(
+                            self.org_module[0],
+                            base_weight,
+                        )
+                        == 0
+                    )
+                    if self.dora_zero_mask.is_meta:
+                        derived_mask = derived_mask.to(dtype=torch.bool)
+                    else:
+                        derived_mask = derived_mask.to(
+                            device=self.dora_zero_mask.device,
+                            dtype=torch.bool,
+                        )
+                        self.dora_zero_mask.copy_(derived_mask)
+                    state_dict[zero_mask_key] = derived_mask
+                    self._dora_zero_mask_pending = self.dora_zero_mask.is_meta
+            else:
+                zero_mask = state_dict[zero_mask_key]
+                self._validate_dora_zero_mask(
+                    self.org_module[0],
+                    zero_mask,
+                    state_dict.get(dora_scale_key, self.dora_scale),
+                )
+                state_dict[zero_mask_key] = zero_mask.to(dtype=torch.bool)
+                self._dora_zero_mask_pending = False
 
-        # Exported LoKr checkpoints fold the scalar into the first factor.  A
-        # module that still owns a trainable scalar must therefore load one.
-        if isinstance(self.scalar, nn.Parameter):
-            state_dict[f"{prefix}scalar"] = (
-                reference.new_ones(())
-                if reference is not None
-                else torch.ones_like(self.scalar)
-            )
-        elif self.scalar.is_meta and reference is not None:
-            self.scalar = reference.new_ones(())
-        else:
-            self.scalar.fill_(1.0)
+        if not has_training_state:
+            # Portable LoKr checkpoints fold the scalar into the first factor.
+            # Existing checkpoints intentionally have no scalar key.
+            scalar_key = f"{prefix}scalar"
+            if isinstance(self.scalar, nn.Parameter):
+                state_dict[scalar_key] = (
+                    reference.new_ones(())
+                    if reference is not None
+                    else torch.ones_like(self.scalar)
+                )
+            else:
+                state_dict.pop(scalar_key, None)
+                if self.scalar.is_meta and reference is not None:
+                    self.scalar = reference.new_ones(())
+                else:
+                    self.scalar.fill_(1.0)
         assign = local_metadata.get("assign_to_params_buffers", False)
         if (self.dtype_tensor.is_meta or assign) and reference is not None:
             self.dtype_tensor = reference.new_zeros(())
@@ -918,6 +1340,8 @@ class LokrModule(LycorisBaseModule):
                 "Stacking LoKr with this adapter on the same target is not "
                 "supported because the composition is base- or order-dependent."
             )
+        if self.wd and getattr(self, "_dora_zero_mask_pending", False):
+            self._resolve_dora_zero_mask(self._current_weight())
         already_applied = self in wrappers
         super().apply_to(**kwargs)
         if not already_applied and self in getattr(module, "_lycoris_wrappers", []):
@@ -939,6 +1363,110 @@ class LokrModule(LycorisBaseModule):
         )
 
     @staticmethod
+    def _tensor_fingerprint(tensor):
+        """Return an exact-value digest without a persistent tensor-sized copy."""
+        if tensor.layout != torch.strided:
+            raise RuntimeError(
+                "LoKr merge conflict detection requires strided target and "
+                "factor tensors."
+            )
+
+        digest = hashlib.sha256()
+        metadata = (
+            str(tensor.dtype),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            str(tensor.layout),
+        )
+        digest.update(repr(metadata).encode("utf-8"))
+
+        tensor = tensor.detach()
+        if tensor.numel() == 0:
+            return digest.digest()
+
+        max_elements = max(
+            1,
+            _MERGE_FINGERPRINT_CHUNK_BYTES // tensor.element_size(),
+        )
+
+        def update(chunk):
+            chunk_bytes = (
+                chunk.resolve_conj()
+                .resolve_neg()
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(-1)
+                .to(device="cpu")
+            )
+            digest.update(chunk_bytes.numpy().tobytes())
+
+        def visit(value):
+            if value.numel() <= max_elements:
+                update(value)
+                return
+
+            split_dim = next(
+                index for index, size in enumerate(value.shape) if size > 1
+            )
+            elements_per_index = value.numel() // value.shape[split_dim]
+            step = max(1, max_elements // elements_per_index)
+            for start in range(0, value.shape[split_dim], step):
+                length = min(step, value.shape[split_dim] - start)
+                visit(value.narrow(split_dim, start, length))
+
+        if tensor.is_contiguous():
+            flat = tensor.reshape(-1)
+            for start in range(0, flat.numel(), max_elements):
+                update(flat.narrow(0, start, min(max_elements, flat.numel() - start)))
+        else:
+            visit(tensor)
+        return digest.digest()
+
+    def _merge_state_fingerprint(self):
+        """Commit to every adapter value that can affect merge composition."""
+        digest = hashlib.sha256()
+        module = self.org_module[0]
+        config = (
+            self.module_type,
+            tuple(self.shape),
+            self.use_w1,
+            self.use_w2,
+            self.tucker,
+            self.wd,
+            self.wd_on_out,
+            self.scale,
+            getattr(module, "groups", None),
+            getattr(self, "_lokr_application_order", None),
+        )
+        digest.update(repr(config).encode("utf-8"))
+
+        for name in (
+            "lokr_w1",
+            "lokr_w1_a",
+            "lokr_w1_b",
+            "lokr_w2",
+            "lokr_w2_a",
+            "lokr_w2_b",
+            "lokr_t2",
+            "scalar",
+            "dora_scale",
+            "dora_zero_mask",
+            "lokr_residual_scale",
+        ):
+            digest.update(name.encode("utf-8"))
+            tensor = getattr(self, name, None)
+            if tensor is None:
+                digest.update(b"\x00")
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise RuntimeError(
+                    f"LoKr merge state {name} was replaced with a non-Tensor value."
+                )
+            digest.update(b"\x01")
+            digest.update(self._tensor_fingerprint(tensor))
+        return digest.digest()
+
+    @staticmethod
     def _clear_merge_ledger(module):
         for name in (
             "_lycoris_lokr_merge_base",
@@ -946,9 +1474,79 @@ class LokrModule(LycorisBaseModule):
             "_lycoris_lokr_merge_order",
             "_lycoris_lokr_merge_precise",
             "_lycoris_lokr_merge_weight_param",
+            "_lycoris_lokr_merge_weight_param_ref",
             "_lycoris_lokr_merge_weight_version",
+            "_lycoris_lokr_merge_weight_fingerprint",
+            "_lycoris_lokr_merge_adapter_fingerprints",
         ):
             module.__dict__.pop(name, None)
+
+    @classmethod
+    def _merge_target_conflict(cls, module, weight_param):
+        stored_param_ref = module.__dict__.get("_lycoris_lokr_merge_weight_param_ref")
+        stored_param = (
+            stored_param_ref()
+            if isinstance(stored_param_ref, weakref.ReferenceType)
+            else module.__dict__.get("_lycoris_lokr_merge_weight_param")
+        )
+        if stored_param is not weight_param:
+            return "parameter"
+
+        stored_fingerprint = module.__dict__.get(
+            "_lycoris_lokr_merge_weight_fingerprint"
+        )
+        if stored_fingerprint is None:
+            return "missing_fingerprint"
+        if cls._tensor_fingerprint(weight_param) == stored_fingerprint:
+            return None
+        if weight_param._version != module._lycoris_lokr_merge_weight_version:
+            return "tracked_write"
+        return "untracked_write"
+
+    @staticmethod
+    def _raise_merge_target_conflict(conflict):
+        if conflict == "parameter":
+            raise RuntimeError(
+                "The target weight Parameter was replaced outside the active "
+                "LoKr merge ledger; refusing to overwrite it."
+            )
+        if conflict == "tracked_write":
+            raise RuntimeError(
+                "The target weight changed outside the active LoKr merge "
+                "ledger; refusing to overwrite the external update."
+            )
+        if conflict == "untracked_write":
+            raise RuntimeError(
+                "The target weight changed through an untracked data write "
+                "outside the active LoKr merge ledger; refusing to overwrite it."
+            )
+        raise RuntimeError(
+            "The active LoKr merge ledger has no target fingerprint; refusing "
+            "to overwrite the target."
+        )
+
+    @staticmethod
+    def _changed_merge_adapters(module):
+        entries = module._lycoris_lokr_merge_entries
+        fingerprints = module.__dict__.get(
+            "_lycoris_lokr_merge_adapter_fingerprints",
+            {},
+        )
+        return [
+            adapter
+            for adapter in entries
+            if fingerprints.get(adapter) != adapter._merge_state_fingerprint()
+        ]
+
+    @staticmethod
+    def _raise_merge_factor_conflict():
+        raise RuntimeError(
+            "An active LoKr factor changed after the reversible merge. Normal "
+            "merge, partial undo, and finalize operations cannot safely infer "
+            "the earlier composition. Resolve the complete target ledger with "
+            "resolve_merge_conflict(strategy='restore_base') or "
+            "resolve_merge_conflict(strategy='adopt_current')."
+        )
 
     @staticmethod
     @torch.no_grad()
@@ -985,15 +1583,11 @@ class LokrModule(LycorisBaseModule):
 
     @torch.no_grad()
     def _validate_merge_ledger(self, module, weight_param):
-        stored_param = module.__dict__.get("_lycoris_lokr_merge_weight_param")
-        if stored_param is not weight_param:
-            raise RuntimeError(
-                "The target weight Parameter was replaced outside the active "
-                "LoKr merge ledger; refusing to overwrite it."
-            )
-        version_changed = (
-            weight_param._version != module._lycoris_lokr_merge_weight_version
-        )
+        target_conflict = self._merge_target_conflict(module, weight_param)
+        if target_conflict is not None:
+            self._raise_merge_target_conflict(target_conflict)
+        if self._changed_merge_adapters(module):
+            self._raise_merge_factor_conflict()
 
         expected = self._compose_merge_ledger(
             module._lycoris_lokr_merge_base,
@@ -1003,16 +1597,80 @@ class LokrModule(LycorisBaseModule):
             weight_param,
         )
         if not self._tensor_values_equal(weight_param, expected):
-            if version_changed:
-                raise RuntimeError(
-                    "The target weight changed outside the active LoKr merge "
-                    "ledger; refusing to overwrite the external update."
-                )
-            raise RuntimeError(
-                "The target weight or an active LoKr factor changed through an "
-                "untracked data write; refusing to overwrite it."
-            )
+            self._raise_merge_factor_conflict()
         module._lycoris_lokr_merge_weight_version = weight_param._version
+
+    @torch.no_grad()
+    def resolve_merge_conflict(self, *, strategy: str) -> bool:
+        """Resolve an invalid reversible ledger without a partial rebase."""
+        valid_strategies = ("restore_base", "adopt_current")
+        if strategy not in valid_strategies:
+            raise ValueError(
+                "LoKr merge conflict strategy must be 'restore_base' or "
+                f"'adopt_current', got {strategy!r}."
+            )
+
+        module = self.org_module[0]
+        entries = getattr(module, "_lycoris_lokr_merge_entries", None)
+        if not entries:
+            return False
+        if self not in entries:
+            raise RuntimeError(
+                "This LoKr adapter is not part of the target's active reversible "
+                "merge ledger."
+            )
+        if any(
+            name in module.__dict__
+            for name in (
+                "_lycoris_precise_weight_base",
+                "_lycoris_precise_weight_current",
+                "_lycoris_precise_bias_base",
+                "_lycoris_precise_bias_current",
+            )
+        ):
+            raise RuntimeError(
+                "Cannot resolve overlapping LoKr and different-adapter precise "
+                "merge states."
+            )
+
+        weight_param = module.weight
+        target_conflict = self._merge_target_conflict(module, weight_param)
+        factors_changed = bool(self._changed_merge_adapters(module))
+        composition_changed = False
+        if target_conflict is None and not factors_changed:
+            expected = self._compose_merge_ledger(
+                module._lycoris_lokr_merge_base,
+                entries,
+                module._lycoris_lokr_merge_order,
+                module._lycoris_lokr_merge_precise,
+                weight_param,
+            )
+            composition_changed = not self._tensor_values_equal(
+                weight_param,
+                expected,
+            )
+
+        if not target_conflict and not factors_changed and not composition_changed:
+            module._lycoris_lokr_merge_weight_version = weight_param._version
+            raise RuntimeError(
+                "The reversible LoKr merge ledger is valid; use merge_to() for "
+                "normal undo or finalize_merge() to commit it."
+            )
+
+        if strategy == "restore_base":
+            if target_conflict is not None:
+                raise RuntimeError(
+                    "Cannot restore the LoKr merge base because the target weight "
+                    "was changed or replaced outside the ledger. Use "
+                    "strategy='adopt_current' to keep that exact current target."
+                )
+            weight_param.copy_(module._lycoris_lokr_merge_base)
+        else:
+            for adapter in entries:
+                adapter._lokr_merge_committed = True
+
+        self._clear_merge_ledger(module)
+        return True
 
     @torch.no_grad()
     def finalize_merge(self):
@@ -1140,16 +1798,25 @@ class LokrModule(LycorisBaseModule):
             merge_order.sort(key=lambda adapter: adapter._lokr_application_order)
 
         if not entries:
-            weight_param.copy_(
-                merge_base.to(
-                    device=weight_param.device,
-                    dtype=weight_param.dtype,
-                )
-            )
+            weight_param.copy_(merge_base)
             if has_merge_state:
                 self._clear_merge_ledger(module)
             return
 
+        for adapter in entries:
+            if adapter.wd and getattr(
+                adapter,
+                "_dora_zero_mask_pending",
+                False,
+            ):
+                adapter._resolve_dora_zero_mask(merge_base)
+        adapter_fingerprints = {
+            adapter: adapter._merge_state_fingerprint() for adapter in entries
+        }
+        if not has_merge_state:
+            # Probe the target before mutating it so fingerprinting cannot leave
+            # a newly merged weight without its recovery metadata.
+            self._tensor_fingerprint(weight_param)
         merged_weight = self._compose_merge_ledger(
             merge_base,
             entries,
@@ -1164,8 +1831,14 @@ class LokrModule(LycorisBaseModule):
         module._lycoris_lokr_merge_entries = entries
         module._lycoris_lokr_merge_order = merge_order
         module._lycoris_lokr_merge_precise = use_precise_merge
-        module.__dict__["_lycoris_lokr_merge_weight_param"] = weight_param
+        module.__dict__["_lycoris_lokr_merge_weight_param_ref"] = weakref.ref(
+            weight_param
+        )
         module._lycoris_lokr_merge_weight_version = weight_param._version
+        module._lycoris_lokr_merge_weight_fingerprint = self._tensor_fingerprint(
+            weight_param
+        )
+        module._lycoris_lokr_merge_adapter_fingerprints = adapter_fingerprints
 
     @classmethod
     @torch.no_grad()
@@ -1290,6 +1963,8 @@ class LokrModule(LycorisBaseModule):
             module.__dict__.pop("_lycoris_onfly_stack", None)
 
     def apply_weight_decompose(self, weight, multiplier=1, base_weight=None):
+        if base_weight is None:
+            base_weight = self._current_weight()
         compute_dtype = torch.promote_types(weight.dtype, self.dora_scale.dtype)
         compute_dtype = self._dora_accumulator_dtype(compute_dtype)
         direction = weight.to(dtype=compute_dtype)
@@ -1352,11 +2027,23 @@ class LokrModule(LycorisBaseModule):
         direction_norm = direction_norm.clamp_min(
             torch.finfo(direction.dtype).tiny
         ).detach()
-        dora_weight = scaled_direction * (magnitude / direction_norm)
+        normalized_direction = scaled_direction * (magnitude / direction_norm)
+        zero_mask = self._resolve_dora_zero_mask(base_weight).to(
+            device=direction.device,
+            dtype=torch.bool,
+        )
+        if tuple(zero_mask.shape) != magnitude_shape:
+            raise RuntimeError(
+                "dora_zero_mask no longer matches dora_scale: "
+                f"mask={tuple(zero_mask.shape)}, dora_scale={magnitude_shape}."
+            )
+        dora_weight = torch.where(
+            zero_mask,
+            scaled_direction,
+            normalized_direction,
+        )
         dora_weight = dora_weight.reshape_as(direction)
 
-        if base_weight is None:
-            base_weight = self._current_weight()
         base_weight = base_weight.to(dora_weight)
         # The runtime multiplier scales the complete DoRA adapter residual.
         return base_weight + (dora_weight - base_weight) * multiplier
@@ -1366,12 +2053,38 @@ class LokrModule(LycorisBaseModule):
         destination["alpha"] = self.alpha
         destination["lokr_residual_scale"] = self.lokr_residual_scale
         if self.wd:
+            if getattr(self, "_dora_zero_mask_pending", False):
+                base_weight = self._current_weight()
+                if not base_weight.is_meta:
+                    self._resolve_dora_zero_mask(base_weight)
             destination["dora_scale"] = self.dora_scale
+            # The mask records initialization-time semantics, not merely an
+            # optimization for zero-valued slices.  Omitting an all-false mask
+            # would make a new checkpoint indistinguishable from a legacy one,
+            # whose mask must be derived from the base at load time.
+            destination["dora_zero_mask"] = self.dora_zero_mask
         if self.use_w1:
             destination["lokr_w1"] = self.lokr_w1 * self.scalar
         else:
             destination["lokr_w1_a"] = self.lokr_w1_a * self.scalar
             destination["lokr_w1_b"] = self.lokr_w1_b
+
+        # A portable checkpoint must keep the historical folded first factor,
+        # but folding loses the scalar (and loses the complete factor when the
+        # scalar is zero).  Standard PyTorch/Accelerate state saves therefore
+        # carry a versioned, resume-only copy of the original parameterization.
+        # ``strip_training_state_keys`` removes these entries for a minimal
+        # portable inference export.
+        if isinstance(self.scalar, nn.Parameter):
+            destination[_TRAINING_STATE_VERSION_KEY] = self.scalar.new_tensor(
+                _TRAINING_STATE_VERSION,
+                dtype=torch.int64,
+            )
+            destination[_TRAINING_STATE_SCALAR_KEY] = self.scalar
+            if self.use_w1:
+                destination[_TRAINING_STATE_W1_KEY] = self.lokr_w1
+            else:
+                destination[_TRAINING_STATE_W1_A_KEY] = self.lokr_w1_a
 
         if self.use_w2:
             destination["lokr_w2"] = self.lokr_w2

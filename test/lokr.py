@@ -1,5 +1,8 @@
 import copy
+import os
+import tempfile
 import unittest
+import weakref
 from unittest import mock
 
 import torch
@@ -826,8 +829,675 @@ class LokrConsistencyTests(unittest.TestCase):
 
         self.assertFalse(state_dict["lokr_w1"].requires_grad)
         self.assertFalse(state_dict["lokr_w2"].requires_grad)
+        self.assertFalse(state_dict["_lycoris_lokr_training_unfolded_w1"].requires_grad)
+        self.assertFalse(state_dict["_lycoris_lokr_training_scalar"].requires_grad)
         self.assertTrue(state_dict_with_vars["lokr_w1"].requires_grad)
         self.assertTrue(state_dict_with_vars["lokr_w2"].requires_grad)
+        self.assertTrue(
+            state_dict_with_vars["_lycoris_lokr_training_unfolded_w1"].requires_grad
+        )
+        self.assertTrue(
+            state_dict_with_vars["_lycoris_lokr_training_scalar"].requires_grad
+        )
+
+    def test_training_state_preserves_zero_scalar_and_unfolded_factor(self):
+        base = nn.Linear(8, 8)
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            use_scalar=True,
+        )
+        self.assertEqual(source.scalar.item(), 0.0)
+        state_dict = source.state_dict()
+
+        self.assertEqual(torch.count_nonzero(state_dict["lokr_w1"]).item(), 0)
+        self.assertTrue(
+            torch.equal(
+                state_dict["_lycoris_lokr_training_unfolded_w1"],
+                source.lokr_w1,
+            )
+        )
+
+        target = LokrModule(
+            "target",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            use_scalar=True,
+        )
+        result = target.load_state_dict(state_dict, strict=True)
+
+        self.assertEqual(result.missing_keys, [])
+        self.assertEqual(result.unexpected_keys, [])
+        self.assertEqual(target.scalar.item(), 0.0)
+        self.assertTrue(torch.equal(target.lokr_w1, source.lokr_w1))
+        self.assertTrue(torch.equal(target.lokr_w2, source.lokr_w2))
+
+    def test_training_state_preserves_low_rank_first_factor(self):
+        base = nn.Linear(64, 64)
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=1,
+            factor=4,
+            decompose_both=True,
+            use_scalar=True,
+        )
+        with torch.no_grad():
+            source.scalar.fill_(0.37)
+        state_dict = source.state_dict()
+
+        self.assertFalse(source.use_w1)
+        self.assertIn("_lycoris_lokr_training_unfolded_w1_a", state_dict)
+        self.assertNotIn("_lycoris_lokr_training_unfolded_w1", state_dict)
+
+        target = LokrModule(
+            "target",
+            base,
+            lora_dim=1,
+            factor=4,
+            decompose_both=True,
+            use_scalar=True,
+        )
+        result = target.load_state_dict(state_dict, strict=True)
+
+        self.assertEqual(result.missing_keys, [])
+        self.assertEqual(result.unexpected_keys, [])
+        for name, source_parameter in source.named_parameters():
+            self.assertTrue(
+                torch.equal(
+                    dict(target.named_parameters())[name],
+                    source_parameter,
+                )
+            )
+
+    def test_training_state_reconstruction_preserves_scalar_parameterization(self):
+        cases = (
+            (
+                nn.Linear(8, 8),
+                {"lora_dim": 4, "full_matrix": True},
+            ),
+            (
+                nn.Linear(64, 64),
+                {"lora_dim": 1, "factor": 4, "decompose_both": True},
+            ),
+        )
+        for base, kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                source = LokrModule(
+                    "source",
+                    base,
+                    use_scalar=True,
+                    **kwargs,
+                )
+                with torch.no_grad():
+                    source.scalar.fill_(0.37)
+                state_dict = source.state_dict()
+                weights = tuple(state_dict.get(name) for name in source.weight_list)
+
+                rebuilt = LokrModule.make_module_from_state_dict(
+                    "rebuilt",
+                    base,
+                    *weights,
+                )
+
+                self.assertIsInstance(rebuilt.scalar, nn.Parameter)
+                self.assertTrue(torch.equal(rebuilt.scalar, source.scalar))
+                for name, parameter in source.named_parameters():
+                    self.assertTrue(
+                        torch.equal(
+                            dict(rebuilt.named_parameters())[name],
+                            parameter,
+                        )
+                    )
+
+    def test_checkpoint_reconstruction_preserves_parameter_registration_order(self):
+        cases = (
+            (
+                lambda: nn.Linear(8, 8, bias=False),
+                {"lora_dim": 4, "full_matrix": True},
+            ),
+            (
+                lambda: nn.Linear(64, 64, bias=False),
+                {"lora_dim": 1, "factor": 4, "decompose_both": True},
+            ),
+            (
+                lambda: nn.Conv2d(16, 16, 3, bias=False),
+                {
+                    "lora_dim": 1,
+                    "factor": 4,
+                    "decompose_both": True,
+                    "use_tucker": True,
+                },
+            ),
+        )
+        for make_base, kwargs in cases:
+            for weight_decompose in (False, True):
+                for use_scalar in (False, True):
+                    with self.subTest(
+                        kwargs=kwargs,
+                        weight_decompose=weight_decompose,
+                        use_scalar=use_scalar,
+                    ):
+                        base = make_base()
+                        source = LokrModule(
+                            "source",
+                            base,
+                            weight_decompose=weight_decompose,
+                            use_scalar=use_scalar,
+                            **kwargs,
+                        )
+                        state_dict = source.state_dict()
+                        weights = tuple(
+                            state_dict.get(name) for name in source.weight_list
+                        )
+
+                        rebuilt = LokrModule.make_module_from_state_dict(
+                            "rebuilt",
+                            base,
+                            *weights,
+                        )
+
+                        source_order = [
+                            (name, tuple(parameter.shape))
+                            for name, parameter in source.named_parameters()
+                        ]
+                        rebuilt_order = [
+                            (name, tuple(parameter.shape))
+                            for name, parameter in rebuilt.named_parameters()
+                        ]
+                        self.assertEqual(rebuilt_order, source_order)
+
+    def test_reconstructed_training_state_resumes_adamw_exactly(self):
+        template_base = nn.Linear(8, 8, bias=False).requires_grad_(False)
+        source_base = copy.deepcopy(template_base)
+        rebuilt_base = copy.deepcopy(template_base)
+        source = LokrModule(
+            "source",
+            source_base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+            use_scalar=True,
+        )
+        source.apply_to()
+        source_optimizer = torch.optim.AdamW(
+            source.parameters(),
+            lr=0.01,
+            betas=(0.9, 0.99),
+            foreach=False,
+        )
+        test_input = torch.randn(4, 8)
+        desired_output = torch.randn(4, 8)
+
+        def train_step(base, optimizer):
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.mse_loss(base(test_input), desired_output)
+            loss.backward()
+            optimizer.step()
+            return loss.detach()
+
+        for _ in range(3):
+            train_step(source_base, source_optimizer)
+
+        state_dict = copy.deepcopy(source.state_dict())
+        optimizer_state = copy.deepcopy(source_optimizer.state_dict())
+        weights = tuple(state_dict.get(name) for name in source.weight_list)
+        rebuilt = LokrModule.make_module_from_state_dict(
+            "rebuilt",
+            rebuilt_base,
+            *weights,
+        )
+        rebuilt.apply_to()
+        rebuilt_optimizer = torch.optim.AdamW(
+            rebuilt.parameters(),
+            lr=0.01,
+            betas=(0.9, 0.99),
+            foreach=False,
+        )
+        rebuilt_optimizer.load_state_dict(optimizer_state)
+
+        self.assertEqual(
+            [
+                (name, tuple(parameter.shape))
+                for name, parameter in rebuilt.named_parameters()
+            ],
+            [
+                (name, tuple(parameter.shape))
+                for name, parameter in source.named_parameters()
+            ],
+        )
+        self.assertTrue(torch.equal(rebuilt_base(test_input), source_base(test_input)))
+
+        source_loss = train_step(source_base, source_optimizer)
+        rebuilt_loss = train_step(rebuilt_base, rebuilt_optimizer)
+
+        self.assertTrue(torch.equal(rebuilt_loss, source_loss))
+        for (source_name, source_parameter), (
+            rebuilt_name,
+            rebuilt_parameter,
+        ) in zip(source.named_parameters(), rebuilt.named_parameters()):
+            self.assertEqual(rebuilt_name, source_name)
+            self.assertTrue(torch.equal(rebuilt_parameter, source_parameter))
+        source_optimizer_state = source_optimizer.state_dict()
+        rebuilt_optimizer_state = rebuilt_optimizer.state_dict()
+        self.assertEqual(
+            rebuilt_optimizer_state["param_groups"],
+            source_optimizer_state["param_groups"],
+        )
+        for parameter_id, source_parameter_state in source_optimizer_state[
+            "state"
+        ].items():
+            rebuilt_parameter_state = rebuilt_optimizer_state["state"][parameter_id]
+            self.assertEqual(
+                rebuilt_parameter_state.keys(),
+                source_parameter_state.keys(),
+            )
+            for key, source_value in source_parameter_state.items():
+                rebuilt_value = rebuilt_parameter_state[key]
+                if isinstance(source_value, torch.Tensor):
+                    self.assertTrue(torch.equal(rebuilt_value, source_value))
+                else:
+                    self.assertEqual(rebuilt_value, source_value)
+
+    def test_portable_state_keeps_folded_factor_and_legacy_scalar_semantics(self):
+        base = nn.Linear(8, 8)
+        source = self._make_full_matrix_dora(base, use_scalar=True)
+        expected, _ = source.get_merged_weight(1.0, base.weight.shape)
+        portable_state = copy.deepcopy(source.state_dict())
+
+        returned = LokrModule.strip_training_state_keys(portable_state)
+
+        self.assertIs(returned, portable_state)
+        self.assertFalse(
+            any(LokrModule.is_training_state_key(key) for key in portable_state)
+        )
+        self.assertNotIn("scalar", portable_state)
+        self.assertTrue(
+            torch.equal(
+                portable_state["lokr_w1"],
+                source.lokr_w1.detach() * source.scalar.detach(),
+            )
+        )
+
+        target = self._make_full_matrix_dora(base, use_scalar=True)
+        result = target.load_state_dict(portable_state, strict=True)
+        actual, _ = target.get_merged_weight(1.0, base.weight.shape)
+
+        self.assertEqual(result.missing_keys, [])
+        self.assertEqual(result.unexpected_keys, [])
+        self.assertEqual(target.scalar.item(), 1.0)
+        self.assertTrue(torch.equal(target.lokr_w1, portable_state["lokr_w1"]))
+        torch.testing.assert_close(actual, expected)
+
+    def test_network_save_weights_writes_only_portable_scalar_state(self):
+        from safetensors.torch import load_file
+
+        for network_type in (LycorisNetwork, LycorisNetworkKohya):
+            for extension in (".pt", ".safetensors"):
+                with self.subTest(
+                    network_type=network_type.__name__,
+                    extension=extension,
+                ):
+                    base = nn.Linear(8, 8)
+                    module = LokrModule(
+                        "adapter",
+                        base,
+                        lora_dim=4,
+                        full_matrix=True,
+                        use_scalar=True,
+                    )
+                    with torch.no_grad():
+                        module.scalar.fill_(0.37)
+                    expected_w1 = module.lokr_w1.detach() * module.scalar.detach()
+                    network = network_type.__new__(network_type)
+                    nn.Module.__init__(network)
+                    network.add_module(module.lora_name, module)
+
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = os.path.join(directory, f"adapter{extension}")
+                        network.save_weights(path, None, {})
+                        if extension == ".safetensors":
+                            state_dict = load_file(path)
+                        else:
+                            state_dict = torch.load(
+                                path,
+                                map_location="cpu",
+                                weights_only=True,
+                            )
+
+                    self.assertFalse(
+                        any(LokrModule.is_training_state_key(key) for key in state_dict)
+                    )
+                    self.assertNotIn("adapter.scalar", state_dict)
+                    self.assertTrue(
+                        torch.equal(state_dict["adapter.lokr_w1"], expected_w1)
+                    )
+
+    def test_low_precision_portable_save_preserves_dora_master_and_mask_dtypes(self):
+        from safetensors.torch import load_file
+
+        for network_type in (LycorisNetwork, LycorisNetworkKohya):
+            for extension in (".pt", ".safetensors"):
+                with self.subTest(
+                    network_type=network_type.__name__,
+                    extension=extension,
+                ):
+                    base = nn.Linear(8, 8, bias=False)
+                    with torch.no_grad():
+                        base.weight[0].zero_()
+                    module = LokrModule(
+                        "adapter",
+                        base,
+                        lora_dim=4,
+                        full_matrix=True,
+                        weight_decompose=True,
+                    )
+                    locon = LoConModule(
+                        "locon",
+                        nn.Linear(8, 8, bias=False),
+                        lora_dim=2,
+                        weight_decompose=True,
+                    )
+                    network = network_type.__new__(network_type)
+                    nn.Module.__init__(network)
+                    network.add_module(module.lora_name, module)
+                    network.add_module(locon.lora_name, locon)
+
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = os.path.join(directory, f"adapter{extension}")
+                        network.save_weights(path, torch.bfloat16, {})
+                        state_dict = (
+                            load_file(path)
+                            if extension == ".safetensors"
+                            else torch.load(
+                                path,
+                                map_location="cpu",
+                                weights_only=True,
+                            )
+                        )
+
+                    self.assertEqual(
+                        state_dict["adapter.lokr_w1"].dtype,
+                        torch.bfloat16,
+                    )
+                    self.assertEqual(
+                        state_dict["adapter.dora_scale"].dtype,
+                        torch.float32,
+                    )
+                    self.assertEqual(
+                        state_dict["adapter.dora_zero_mask"].dtype,
+                        torch.bool,
+                    )
+                    self.assertEqual(
+                        state_dict["locon.dora_scale"].dtype,
+                        torch.bfloat16,
+                    )
+
+    def test_training_state_and_optimizer_resume_exactly(self):
+        template_base = nn.Linear(8, 8)
+        source_base = copy.deepcopy(template_base).requires_grad_(False)
+        target_base = copy.deepcopy(template_base).requires_grad_(False)
+        source = self._make_full_matrix_dora(source_base, use_scalar=True)
+        target = self._make_full_matrix_dora(target_base, use_scalar=True)
+        source.apply_to()
+        target.apply_to()
+        source_container = nn.ModuleList((source,))
+        target_container = nn.ModuleList((target,))
+        source_optimizer = torch.optim.AdamW(
+            source.parameters(),
+            lr=0.01,
+            betas=(0.9, 0.99),
+            foreach=False,
+        )
+        target_optimizer = torch.optim.AdamW(
+            target.parameters(),
+            lr=0.01,
+            betas=(0.9, 0.99),
+            foreach=False,
+        )
+        test_input = torch.randn(4, 8)
+        desired_output = torch.randn(4, 8)
+
+        def train_step(base, optimizer):
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.mse_loss(base(test_input), desired_output)
+            loss.backward()
+            optimizer.step()
+            return loss.detach()
+
+        for _ in range(3):
+            train_step(source_base, source_optimizer)
+
+        training_state = copy.deepcopy(source_container.state_dict())
+        optimizer_state = copy.deepcopy(source_optimizer.state_dict())
+        result = target_container.load_state_dict(training_state, strict=True)
+        target_optimizer.load_state_dict(optimizer_state)
+
+        self.assertEqual(result.missing_keys, [])
+        self.assertEqual(result.unexpected_keys, [])
+        self.assertNotEqual(source.scalar.item(), 1.0)
+        self.assertTrue(torch.equal(target.scalar, source.scalar))
+        self.assertTrue(torch.equal(target.lokr_w1, source.lokr_w1))
+        self.assertTrue(torch.equal(target.lokr_w2, source.lokr_w2))
+        self.assertTrue(torch.equal(target.dora_scale, source.dora_scale))
+        self.assertTrue(torch.equal(target_base(test_input), source_base(test_input)))
+
+        source_loss = train_step(source_base, source_optimizer)
+        target_loss = train_step(target_base, target_optimizer)
+
+        self.assertTrue(torch.equal(target_loss, source_loss))
+        for source_parameter, target_parameter in zip(
+            source.parameters(),
+            target.parameters(),
+        ):
+            self.assertTrue(torch.equal(target_parameter, source_parameter))
+        source_optimizer_state = source_optimizer.state_dict()
+        target_optimizer_state = target_optimizer.state_dict()
+        self.assertEqual(
+            source_optimizer_state["param_groups"],
+            target_optimizer_state["param_groups"],
+        )
+        for parameter_id, source_parameter_state in source_optimizer_state[
+            "state"
+        ].items():
+            target_parameter_state = target_optimizer_state["state"][parameter_id]
+            self.assertEqual(
+                source_parameter_state.keys(),
+                target_parameter_state.keys(),
+            )
+            for key, source_value in source_parameter_state.items():
+                target_value = target_parameter_state[key]
+                if isinstance(source_value, torch.Tensor):
+                    self.assertTrue(torch.equal(target_value, source_value))
+                else:
+                    self.assertEqual(target_value, source_value)
+
+    def test_incomplete_training_state_is_rejected(self):
+        base = nn.Linear(8, 8)
+        source = self._make_full_matrix_dora(base, use_scalar=True)
+        state_dict = source.state_dict()
+        state_dict.pop("_lycoris_lokr_training_scalar")
+        target = self._make_full_matrix_dora(base, use_scalar=True)
+
+        with self.assertRaisesRegex(RuntimeError, "Incomplete.*training state"):
+            target.load_state_dict(state_dict, strict=False)
+
+    def test_training_state_rejects_non_scalar_target_transactionally(self):
+        base = nn.Linear(8, 8)
+        source = self._make_full_matrix_dora(base, use_scalar=True)
+        training_state = source.state_dict()
+
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                target = LokrModule(
+                    "target",
+                    base,
+                    lora_dim=4,
+                    full_matrix=True,
+                    use_scalar=False,
+                )
+                before = {
+                    name: tensor.detach().clone()
+                    for name, tensor in (
+                        ("lokr_w1", target.lokr_w1),
+                        ("lokr_w2", target.lokr_w2),
+                        ("scalar", target.scalar),
+                    )
+                }
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "use_scalar=False",
+                ):
+                    target.load_state_dict(
+                        copy.deepcopy(training_state),
+                        strict=strict,
+                    )
+
+                self.assertTrue(torch.equal(target.lokr_w1, before["lokr_w1"]))
+                self.assertTrue(torch.equal(target.lokr_w2, before["lokr_w2"]))
+                self.assertTrue(torch.equal(target.scalar, before["scalar"]))
+
+    def test_training_state_rejects_unsupported_version(self):
+        base = nn.Linear(8, 8)
+        source = self._make_full_matrix_dora(base, use_scalar=True)
+        state_dict = source.state_dict()
+        state_dict["_lycoris_lokr_training_version"] = torch.tensor(2)
+        target = self._make_full_matrix_dora(base, use_scalar=True)
+
+        with self.assertRaisesRegex(RuntimeError, "Unsupported.*version"):
+            target.load_state_dict(state_dict, strict=False)
+
+    def test_malformed_training_scalars_are_rejected_by_all_load_paths(self):
+        base = nn.Linear(8, 8)
+        source = self._make_full_matrix_dora(base, use_scalar=True)
+        malformed_values = (
+            (
+                "float_version",
+                "_lycoris_lokr_training_version",
+                torch.tensor(1.0),
+                "version",
+            ),
+            (
+                "bool_version",
+                "_lycoris_lokr_training_version",
+                torch.tensor(True),
+                "version",
+            ),
+            (
+                "vector_version",
+                "_lycoris_lokr_training_version",
+                torch.tensor([1], dtype=torch.int64),
+                "version",
+            ),
+            (
+                "vector_scalar",
+                "_lycoris_lokr_training_scalar",
+                torch.tensor([0.0]),
+                "scalar",
+            ),
+            (
+                "bool_scalar",
+                "_lycoris_lokr_training_scalar",
+                torch.tensor(False),
+                "scalar",
+            ),
+        )
+
+        for case_name, key, value, message in malformed_values:
+            for load_path in ("direct", "reconstruct"):
+                with self.subTest(case=case_name, load_path=load_path):
+                    state_dict = copy.deepcopy(source.state_dict())
+                    state_dict[key] = value
+                    if load_path == "direct":
+                        target = self._make_full_matrix_dora(
+                            base,
+                            use_scalar=True,
+                        )
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            target.load_state_dict(state_dict, strict=False)
+                    else:
+                        weights = tuple(
+                            state_dict.get(name) for name in source.weight_list
+                        )
+                        with self.assertRaisesRegex(ValueError, message):
+                            LokrModule.make_module_from_state_dict(
+                                "rebuilt",
+                                base,
+                                *weights,
+                            )
+
+    def test_zero_scalar_and_empty_optimizer_resume_exactly(self):
+        template_base = nn.Linear(8, 8).requires_grad_(False)
+        source_base = copy.deepcopy(template_base)
+        target_base = copy.deepcopy(template_base)
+        source = LokrModule(
+            "source",
+            source_base,
+            lora_dim=4,
+            full_matrix=True,
+            use_scalar=True,
+        )
+        target = LokrModule(
+            "target",
+            target_base,
+            lora_dim=4,
+            full_matrix=True,
+            use_scalar=True,
+        )
+        source.apply_to()
+        target.apply_to()
+        source_optimizer = torch.optim.AdamW(
+            source.parameters(),
+            lr=0.01,
+            foreach=False,
+        )
+        target_optimizer = torch.optim.AdamW(
+            target.parameters(),
+            lr=0.01,
+            foreach=False,
+        )
+        target.load_state_dict(copy.deepcopy(source.state_dict()), strict=True)
+        target_optimizer.load_state_dict(copy.deepcopy(source_optimizer.state_dict()))
+        inputs = torch.randn(4, 8)
+        desired = torch.randn(4, 8)
+
+        self.assertEqual(source.scalar.item(), 0.0)
+        self.assertEqual(len(source_optimizer.state), 0)
+        for _ in range(2):
+            losses = []
+            for base, optimizer in (
+                (source_base, source_optimizer),
+                (target_base, target_optimizer),
+            ):
+                optimizer.zero_grad(set_to_none=True)
+                loss = F.mse_loss(base(inputs), desired)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.detach())
+            self.assertTrue(torch.equal(losses[0], losses[1]))
+            for source_parameter, target_parameter in zip(
+                source.parameters(),
+                target.parameters(),
+            ):
+                self.assertTrue(torch.equal(source_parameter, target_parameter))
+
+    def test_automatic_full_factor_selection_sets_full_matrix_state(self):
+        module = LokrModule(
+            "test",
+            nn.Linear(64, 64),
+            lora_dim=100000,
+            factor=-1,
+            decompose_both=False,
+        )
+
+        self.assertTrue(module.use_w1)
+        self.assertTrue(module.use_w2)
+        self.assertTrue(module.full_matrix)
+        self.assertEqual(module.scale, 1.0)
 
     def test_wrapper_full_matrix_dora_checkpoint_round_trip(self):
         base = nn.Sequential(nn.Linear(8, 8))
@@ -1497,6 +2167,566 @@ class LokrConsistencyTests(unittest.TestCase):
                     atol=1e-7,
                 )
 
+    def test_low_precision_cast_keeps_dora_master_parameter_and_initial_noop(self):
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        for device in devices:
+            for dtype in (torch.float16, torch.bfloat16):
+                with self.subTest(device=device, dtype=dtype):
+                    base = nn.Linear(
+                        8,
+                        8,
+                        bias=False,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    module = LokrModule(
+                        "test",
+                        base,
+                        lora_dim=4,
+                        full_matrix=True,
+                        weight_decompose=True,
+                        use_scalar=True,
+                    )
+                    dora_parameter = module.dora_scale
+                    initial_magnitude = dora_parameter.detach().clone()
+                    dora_parameter.grad = torch.ones_like(dora_parameter)
+                    optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
+
+                    module.to(device=device, dtype=dtype)
+
+                    self.assertIs(module.dora_scale, dora_parameter)
+                    self.assertEqual(module.dora_scale.dtype, torch.float32)
+                    self.assertEqual(module.dora_scale.grad.dtype, torch.float32)
+                    self.assertTrue(
+                        any(
+                            parameter is dora_parameter
+                            for group in optimizer.param_groups
+                            for parameter in group["params"]
+                        )
+                    )
+                    torch.testing.assert_close(
+                        module.dora_scale,
+                        initial_magnitude.to(device),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+                    torch.testing.assert_close(
+                        module.dora_scale.grad,
+                        torch.ones_like(module.dora_scale),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+
+                    merged, _ = module.get_merged_weight(
+                        1.0,
+                        base.weight.shape,
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            merged,
+                            base.weight.detach().to(merged),
+                        )
+                    )
+
+    def test_low_precision_cast_keeps_dora_identity_with_overwrite_future(self):
+        devices = [torch.device("cpu")]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        for device in devices:
+            with self.subTest(device=device):
+                base = nn.Linear(
+                    8,
+                    8,
+                    bias=False,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                module = LokrModule(
+                    "test",
+                    base,
+                    lora_dim=4,
+                    full_matrix=True,
+                    weight_decompose=True,
+                )
+                dora_parameter = module.dora_scale
+                optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
+                previous = torch.__future__.get_overwrite_module_params_on_conversion()
+                try:
+                    torch.__future__.set_overwrite_module_params_on_conversion(True)
+                    module.to(device=device, dtype=torch.bfloat16)
+                finally:
+                    torch.__future__.set_overwrite_module_params_on_conversion(previous)
+
+                self.assertIs(module.dora_scale, dora_parameter)
+                self.assertEqual(module.dora_scale.dtype, torch.float32)
+                self.assertTrue(
+                    any(
+                        parameter is dora_parameter
+                        for group in optimizer.param_groups
+                        for parameter in group["params"]
+                    )
+                )
+
+    def test_dora_apply_supports_meta_and_to_empty_lifecycle(self):
+        module = LokrModule(
+            "test",
+            nn.Linear(8, 8, bias=False),
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+
+        module.to(device="meta")
+
+        self.assertTrue(module.dora_scale.is_meta)
+        self.assertTrue(module.lokr_w1.is_meta)
+        state_dict = module.state_dict()
+        self.assertTrue(state_dict["dora_scale"].is_meta)
+        self.assertTrue(state_dict["dora_zero_mask"].is_meta)
+        module.to_empty(device="cpu")
+        self.assertFalse(module.dora_scale.is_meta)
+        self.assertFalse(module.lokr_w1.is_meta)
+
+    def test_zero_base_dora_has_a_live_optimization_path(self):
+        device_dtypes = [(torch.device("cpu"), torch.float32)]
+        if torch.cuda.is_available():
+            device_dtypes.extend(
+                (torch.device("cuda"), dtype)
+                for dtype in (
+                    torch.float32,
+                    torch.float16,
+                    torch.bfloat16,
+                )
+            )
+        for device, dtype in device_dtypes:
+            inputs = torch.randn(32, 8, device=device)
+            target = torch.randn(32, 8, device=device)
+            for wd_on_out in (True, False):
+                for use_scalar in (False, True):
+                    with self.subTest(
+                        device=device,
+                        dtype=dtype,
+                        wd_on_out=wd_on_out,
+                        use_scalar=use_scalar,
+                    ):
+                        base = nn.Linear(
+                            8,
+                            8,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        )
+                        with torch.no_grad():
+                            base.weight.zero_()
+                        base.weight.requires_grad_(False)
+                        module = LokrModule(
+                            "test",
+                            base,
+                            lora_dim=4,
+                            full_matrix=True,
+                            weight_decompose=True,
+                            wd_on_out=wd_on_out,
+                            use_scalar=use_scalar,
+                        ).to(device=device, dtype=dtype)
+                        self.assertTrue(torch.all(module.dora_zero_mask).item())
+                        optimizer = torch.optim.SGD(
+                            module.parameters(),
+                            lr=0.05,
+                        )
+                        losses = []
+
+                        for step in range(8):
+                            optimizer.zero_grad(set_to_none=True)
+                            merged, _ = module.get_merged_weight(
+                                1.0,
+                                base.weight.shape,
+                            )
+                            loss = F.mse_loss(F.linear(inputs, merged), target)
+                            losses.append(loss.detach())
+                            loss.backward()
+                            if step == 0:
+                                live_parameter = (
+                                    module.scalar if use_scalar else module.lokr_w2
+                                )
+                                self.assertIsNotNone(live_parameter.grad)
+                                self.assertGreater(
+                                    live_parameter.grad.abs().sum().item(),
+                                    0.0,
+                                )
+                            optimizer.step()
+
+                        self.assertLess(losses[-1].item(), losses[0].item())
+                        self.assertIsNone(base.weight.grad)
+
+    def test_partial_zero_dora_matches_functional_for_both_norm_axes(self):
+        for wd_on_out in (True, False):
+            with self.subTest(wd_on_out=wd_on_out):
+                base = nn.Linear(8, 8, bias=False)
+                with torch.no_grad():
+                    if wd_on_out:
+                        base.weight[0].zero_()
+                    else:
+                        base.weight[:, 0].zero_()
+                module = self._make_full_matrix_dora(
+                    base,
+                    wd_on_out=wd_on_out,
+                    use_scalar=True,
+                )
+                expected_mask = torch.zeros_like(
+                    module.dora_zero_mask,
+                    dtype=torch.bool,
+                )
+                if wd_on_out:
+                    expected_mask[0] = True
+                else:
+                    expected_mask[:, 0] = True
+                self.assertTrue(torch.equal(module.dora_zero_mask, expected_mask))
+
+                base_weight = base.weight.detach()
+                rebuild = module.get_weight(base_weight.shape) * module.scalar
+                merged, _ = module.get_merged_weight(1.0, base_weight.shape)
+                functional = apply_dora_scale(
+                    base_weight,
+                    rebuild,
+                    module.dora_scale,
+                    1.0,
+                    module.dora_zero_mask,
+                )
+                direction = base_weight.to(rebuild) + rebuild
+
+                torch.testing.assert_close(merged, functional)
+                if wd_on_out:
+                    torch.testing.assert_close(merged[0], direction[0])
+                else:
+                    torch.testing.assert_close(merged[:, 0], direction[:, 0])
+
+    def test_grouped_conv_input_dora_tracks_zero_slices_per_group(self):
+        base = nn.Conv2d(4, 6, kernel_size=3, groups=2, bias=False)
+        with torch.no_grad():
+            grouped = base.weight.reshape(2, 3, 2, 3, 3)
+            grouped[0, :, 0].zero_()
+        module = self._make_full_matrix_dora(
+            base,
+            wd_on_out=False,
+            use_scalar=True,
+        )
+
+        expected_mask = torch.zeros((2, 1, 2, 1, 1), dtype=torch.bool)
+        expected_mask[0, 0, 0] = True
+        self.assertTrue(torch.equal(module.dora_zero_mask.cpu(), expected_mask))
+        base_weight = base.weight.detach()
+        rebuild = module.get_weight(base_weight.shape) * module.scalar
+        merged, _ = module.get_merged_weight(1.0, base_weight.shape)
+        functional = apply_dora_scale(
+            base_weight,
+            rebuild,
+            module.dora_scale,
+            1.0,
+            module.dora_zero_mask,
+        )
+
+        torch.testing.assert_close(merged, functional)
+
+    def test_zero_base_dora_mask_roundtrips_and_legacy_load_derives_it(self):
+        base = nn.Linear(8, 8, bias=False)
+        with torch.no_grad():
+            base.weight.zero_()
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        state_dict = source.state_dict()
+        weights = tuple(state_dict.get(name) for name in source.weight_list)
+
+        rebuilt = LokrModule.make_module_from_state_dict(
+            "rebuilt",
+            base,
+            *weights,
+        )
+        self.assertTrue(torch.equal(rebuilt.dora_zero_mask, source.dora_zero_mask))
+        torch.testing.assert_close(
+            rebuilt.get_merged_weight(1.0, base.weight.shape)[0],
+            source.get_merged_weight(1.0, base.weight.shape)[0],
+        )
+
+        legacy_state = dict(state_dict)
+        legacy_state.pop("dora_zero_mask")
+        legacy_weights = tuple(legacy_state.get(name) for name in source.weight_list)
+        legacy = LokrModule.make_module_from_state_dict(
+            "legacy",
+            base,
+            *legacy_weights,
+        )
+        self.assertTrue(torch.all(legacy.dora_zero_mask).item())
+
+    def test_all_false_dora_mask_is_checkpointed_instead_of_rederived(self):
+        base = nn.Linear(8, 8, bias=False)
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+            use_scalar=True,
+        )
+        self.assertFalse(torch.any(source.dora_zero_mask).item())
+
+        with torch.no_grad():
+            source.lokr_w1.normal_()
+            source.lokr_w2.normal_()
+            source.scalar.fill_(0.25)
+            base.weight[0].zero_()
+
+        state_dict = source.state_dict()
+        self.assertIn("dora_zero_mask", state_dict)
+        self.assertFalse(torch.any(state_dict["dora_zero_mask"]).item())
+        weights = tuple(state_dict.get(name) for name in source.weight_list)
+        rebuilt = LokrModule.make_module_from_state_dict(
+            "rebuilt",
+            base,
+            *weights,
+        )
+
+        self.assertFalse(torch.any(rebuilt.dora_zero_mask).item())
+        torch.testing.assert_close(
+            rebuilt.get_merged_weight(1.0, base.weight.shape)[0],
+            source.get_merged_weight(1.0, base.weight.shape)[0],
+        )
+
+        legacy_state = dict(state_dict)
+        legacy_state.pop("dora_zero_mask")
+        legacy_weights = tuple(legacy_state.get(name) for name in source.weight_list)
+        legacy = LokrModule.make_module_from_state_dict(
+            "legacy",
+            base,
+            *legacy_weights,
+        )
+        self.assertTrue(legacy.dora_zero_mask[0].item())
+
+    def test_dora_mask_must_match_the_magnitude_axis_exactly(self):
+        base = nn.Linear(8, 8, bias=False)
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+            wd_on_out=True,
+        )
+        state_dict = source.state_dict()
+        weights = [state_dict.get(name) for name in source.weight_list]
+        mask_index = source.weight_list.index("dora_zero_mask")
+        weights[mask_index] = torch.zeros((1, 8), dtype=torch.bool)
+
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            LokrModule.make_module_from_state_dict(
+                "rebuilt",
+                base,
+                *weights,
+            )
+
+    def test_assign_load_promotes_legacy_low_precision_dora_magnitude(self):
+        base = nn.Linear(8, 8, bias=False)
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        legacy_state = source.state_dict()
+        legacy_state["dora_scale"] = legacy_state["dora_scale"].to(torch.bfloat16)
+        target = LokrModule(
+            "target",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+
+        target.load_state_dict(legacy_state, strict=True, assign=True)
+
+        self.assertEqual(target.dora_scale.dtype, torch.float32)
+        torch.testing.assert_close(
+            target.dora_scale,
+            legacy_state["dora_scale"].float(),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_assign_load_materializes_legacy_mask_for_meta_created_dora(self):
+        base = nn.Linear(8, 8, bias=False)
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        legacy_state = source.state_dict()
+        legacy_state.pop("dora_zero_mask", None)
+        with torch.device("meta"):
+            target = LokrModule(
+                "target",
+                base,
+                lora_dim=4,
+                full_matrix=True,
+                weight_decompose=True,
+            )
+
+        target.load_state_dict(legacy_state, strict=True, assign=True)
+        merged, _ = target.get_merged_weight(1.0, base.weight.shape)
+
+        self.assertFalse(any(param.is_meta for param in target.parameters()))
+        self.assertFalse(any(buffer.is_meta for buffer in target.buffers()))
+        self.assertEqual(target.dora_scale.dtype, torch.float32)
+        self.assertFalse(torch.any(target.dora_zero_mask).item())
+        self.assertFalse(target._dora_zero_mask_pending)
+        torch.testing.assert_close(merged, base.weight.detach())
+
+    def test_pending_legacy_mask_replaces_meta_buffer_after_base_materializes(self):
+        source_base = nn.Linear(8, 8, bias=False)
+        with torch.no_grad():
+            source_base.weight.zero_()
+        source = LokrModule(
+            "source",
+            source_base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        with torch.no_grad():
+            source.lokr_w1.normal_()
+            source.lokr_w2.normal_()
+        legacy_state = source.state_dict()
+        legacy_state.pop("dora_zero_mask")
+
+        target_base = nn.Linear(8, 8, bias=False)
+        target = LokrModule(
+            "target",
+            target_base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        target.to(device="meta")
+        target_base.to(device="meta")
+        target.load_state_dict(legacy_state, strict=True, assign=True)
+
+        self.assertTrue(target.dora_zero_mask.is_meta)
+        self.assertTrue(target._dora_zero_mask_pending)
+        target_base.to_empty(device="cpu")
+        with torch.no_grad():
+            target_base.weight.zero_()
+        actual, _ = target.get_merged_weight(1.0, target_base.weight.shape)
+        expected, _ = source.get_merged_weight(1.0, source_base.weight.shape)
+
+        self.assertFalse(target.dora_zero_mask.is_meta)
+        self.assertFalse(target._dora_zero_mask_pending)
+        self.assertTrue(torch.all(target.dora_zero_mask).item())
+        torch.testing.assert_close(actual, expected)
+
+    def test_legacy_zero_mask_is_derived_after_meta_base_materializes(self):
+        base = nn.Linear(8, 8, bias=False)
+        with torch.no_grad():
+            base.weight.zero_()
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        with torch.no_grad():
+            source.lokr_w1.normal_()
+            source.lokr_w2.normal_()
+        legacy_state = source.state_dict()
+        legacy_state.pop("dora_zero_mask")
+        weights = tuple(legacy_state.get(name) for name in source.weight_list)
+        meta_base = nn.Linear(8, 8, bias=False, device="meta")
+        rebuilt = LokrModule.make_module_from_state_dict(
+            "rebuilt",
+            meta_base,
+            *weights,
+        )
+
+        self.assertTrue(rebuilt._dora_zero_mask_pending)
+        meta_base.to_empty(device="cpu")
+        with torch.no_grad():
+            meta_base.weight.zero_()
+        actual, _ = rebuilt.get_merged_weight(1.0, meta_base.weight.shape)
+        expected, _ = source.get_merged_weight(1.0, base.weight.shape)
+
+        self.assertFalse(rebuilt._dora_zero_mask_pending)
+        self.assertTrue(torch.all(rebuilt.dora_zero_mask).item())
+        torch.testing.assert_close(actual, expected)
+
+    def test_pending_zero_mask_is_resolved_before_merge_fingerprint(self):
+        base = nn.Linear(8, 8, bias=False)
+        with torch.no_grad():
+            base.weight.zero_()
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        with torch.no_grad():
+            source.lokr_w1.normal_()
+            source.lokr_w2.normal_()
+        legacy_state = source.state_dict()
+        legacy_state.pop("dora_zero_mask")
+        weights = tuple(legacy_state.get(name) for name in source.weight_list)
+        meta_base = nn.Linear(8, 8, bias=False, device="meta")
+        rebuilt = LokrModule.make_module_from_state_dict(
+            "rebuilt",
+            meta_base,
+            *weights,
+        )
+        meta_base.to_empty(device="cpu")
+        with torch.no_grad():
+            meta_base.weight.zero_()
+        original = meta_base.weight.detach().clone()
+
+        rebuilt.merge_to(0.4)
+        rebuilt.merge_to(-0.4)
+
+        self.assertTrue(torch.equal(meta_base.weight, original))
+        self.assertFalse(bool(getattr(meta_base, "_lycoris_lokr_merge_entries", {})))
+
+    def test_legacy_load_reinitializes_an_emptied_zero_mask(self):
+        base = nn.Linear(8, 8, bias=False)
+        source = LokrModule(
+            "source",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        legacy_state = source.state_dict()
+        legacy_state.pop("dora_zero_mask", None)
+        target = LokrModule(
+            "target",
+            base,
+            lora_dim=4,
+            full_matrix=True,
+            weight_decompose=True,
+        )
+        target.to_empty(device="cpu")
+        target.dora_zero_mask.fill_(True)
+
+        result = target.load_state_dict(legacy_state, strict=True)
+
+        self.assertEqual(result.missing_keys, [])
+        self.assertEqual(result.unexpected_keys, [])
+        self.assertFalse(torch.any(target.dora_zero_mask).item())
+
     def test_float64_dora_initialization_preserves_precision(self):
         base = nn.Linear(7, 5, bias=False, dtype=torch.float64)
         module = LokrModule(
@@ -1821,6 +3051,270 @@ class LokrConsistencyTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(RuntimeError, message):
                     module.merge_to(-0.4)
+
+    def test_merge_conflict_resolver_contract(self):
+        base = nn.Linear(8, 8)
+        module = self._make_full_matrix_dora(base)
+
+        with self.assertRaisesRegex(ValueError, "restore_base.*adopt_current"):
+            module.resolve_merge_conflict(strategy="force")
+        for strategy in ("restore_base", "adopt_current"):
+            with self.subTest(strategy=strategy, state="no_ledger"):
+                self.assertFalse(
+                    module.resolve_merge_conflict(strategy=strategy),
+                )
+
+        module.merge_to(0.4)
+        merged_weight = base.weight.detach().clone()
+        entries = dict(base._lycoris_lokr_merge_entries)
+        for strategy in ("restore_base", "adopt_current"):
+            with self.subTest(strategy=strategy, state="valid_ledger"):
+                with self.assertRaisesRegex(RuntimeError, "ledger is valid"):
+                    module.resolve_merge_conflict(strategy=strategy)
+                self.assertTrue(torch.equal(base.weight, merged_weight))
+                self.assertEqual(base._lycoris_lokr_merge_entries, entries)
+
+        module.merge_to(-0.4)
+
+    def test_factor_copy_conflicts_restore_the_complete_ledger(self):
+        for factor_name in (
+            "lokr_w1",
+            "lokr_w2",
+            "scalar",
+            "dora_scale",
+            "lokr_residual_scale",
+        ):
+            with self.subTest(factor=factor_name):
+                base = nn.Linear(8, 8)
+                original_weight = base.weight.detach().clone()
+                module = self._make_full_matrix_dora(base, use_scalar=True)
+                module.merge_to(0.4)
+                merged_weight = base.weight.detach().clone()
+
+                factor = getattr(module, factor_name)
+                mutated_factor = factor.detach().clone().add(0.125)
+                with torch.no_grad():
+                    factor.copy_(mutated_factor)
+
+                with self.assertRaisesRegex(RuntimeError, "factor changed"):
+                    module.merge_to(-0.4)
+                with self.assertRaisesRegex(RuntimeError, "factor changed"):
+                    module.finalize_merge()
+                self.assertTrue(torch.equal(base.weight, merged_weight))
+                self.assertEqual(base._lycoris_lokr_merge_entries, {module: 0.4})
+
+                self.assertTrue(module.resolve_merge_conflict(strategy="restore_base"))
+                self.assertTrue(torch.equal(base.weight, original_weight))
+                self.assertTrue(torch.equal(factor, mutated_factor))
+                self.assertFalse(hasattr(base, "_lycoris_lokr_merge_entries"))
+                self.assertFalse(getattr(module, "_lokr_merge_committed", False))
+
+                module.merge_to(0.2)
+                module.merge_to(-0.2)
+                self.assertTrue(torch.equal(base.weight, original_weight))
+
+    def test_optimizer_factor_conflict_can_adopt_current_target(self):
+        base = nn.Linear(8, 8)
+        module = self._make_full_matrix_dora(base)
+        module.merge_to(0.4)
+        weight_param = base.weight
+        merged_weight = weight_param.detach().clone()
+
+        optimizer = torch.optim.SGD([module.lokr_w1], lr=0.05)
+        module.lokr_w1.grad = torch.ones_like(module.lokr_w1)
+        optimizer.step()
+
+        with self.assertRaisesRegex(RuntimeError, "factor changed"):
+            module.merge_to(-0.4)
+        with self.assertRaisesRegex(RuntimeError, "factor changed"):
+            module.finalize_merge()
+        version_before_resolve = weight_param._version
+
+        self.assertTrue(module.resolve_merge_conflict(strategy="adopt_current"))
+        self.assertIs(base.weight, weight_param)
+        self.assertTrue(torch.equal(base.weight, merged_weight))
+        self.assertEqual(base.weight._version, version_before_resolve)
+        self.assertFalse(hasattr(base, "_lycoris_lokr_merge_entries"))
+        self.assertTrue(module._lokr_merge_committed)
+        with self.assertRaisesRegex(RuntimeError, "committed"):
+            module.merge_to(0.4)
+
+    def test_factor_copied_back_exactly_keeps_ledger_valid(self):
+        base = nn.Linear(8, 8)
+        original_weight = base.weight.detach().clone()
+        module = self._make_full_matrix_dora(base)
+        module.merge_to(0.4)
+        original_factor = module.lokr_w1.detach().clone()
+
+        with torch.no_grad():
+            module.lokr_w1.add_(0.25)
+            module.lokr_w1.copy_(original_factor)
+
+        for strategy in ("restore_base", "adopt_current"):
+            with self.subTest(strategy=strategy):
+                with self.assertRaisesRegex(RuntimeError, "ledger is valid"):
+                    module.resolve_merge_conflict(strategy=strategy)
+        module.merge_to(-0.4)
+        self.assertTrue(torch.equal(base.weight, original_weight))
+
+    def test_target_conflicts_are_never_overwritten_by_resolution(self):
+        for mutation in ("no_grad", "data", "parameter"):
+            with self.subTest(mutation=mutation):
+                base = nn.Linear(8, 8)
+                module = self._make_full_matrix_dora(base)
+                module.merge_to(0.4)
+                with torch.no_grad():
+                    module.lokr_w1.add_(0.125)
+
+                if mutation == "no_grad":
+                    with torch.no_grad():
+                        base.weight.add_(1.0)
+                    normal_message = "changed outside"
+                elif mutation == "data":
+                    base.weight.data.add_(1.0)
+                    normal_message = "untracked data write"
+                else:
+                    base.weight = nn.Parameter(base.weight.detach().add(1.0))
+                    normal_message = "Parameter was replaced"
+
+                current_param = base.weight
+                current_weight = current_param.detach().clone()
+                current_version = current_param._version
+                entries = dict(base._lycoris_lokr_merge_entries)
+
+                with self.assertRaisesRegex(RuntimeError, normal_message):
+                    module.merge_to(-0.4)
+                with self.assertRaisesRegex(RuntimeError, "changed or replaced"):
+                    module.resolve_merge_conflict(strategy="restore_base")
+                self.assertIs(base.weight, current_param)
+                self.assertTrue(torch.equal(base.weight, current_weight))
+                self.assertEqual(base.weight._version, current_version)
+                self.assertEqual(base._lycoris_lokr_merge_entries, entries)
+
+                self.assertTrue(module.resolve_merge_conflict(strategy="adopt_current"))
+                self.assertIs(base.weight, current_param)
+                self.assertTrue(torch.equal(base.weight, current_weight))
+                self.assertEqual(base.weight._version, current_version)
+                self.assertFalse(hasattr(base, "_lycoris_lokr_merge_entries"))
+                self.assertTrue(module._lokr_merge_committed)
+
+    def test_mutated_stacked_merge_resolves_only_as_a_complete_ledger(self):
+        for mutated_index in (0, 1):
+            for undo_index in (0, 1):
+                for strategy in ("restore_base", "adopt_current"):
+                    with self.subTest(
+                        mutated=mutated_index,
+                        undo=undo_index,
+                        strategy=strategy,
+                    ):
+                        base = nn.Linear(8, 8)
+                        original_weight = base.weight.detach().clone()
+                        first = self._make_full_matrix_dora(base, multiplier=0.4)
+                        second = self._make_full_matrix_dora(base, multiplier=0.7)
+                        adapters = (first, second)
+
+                        first.apply_to()
+                        second.apply_to()
+                        second.restore()
+                        first.restore()
+                        first.merge_to(first.multiplier)
+                        second.merge_to(second.multiplier)
+                        merged_weight = base.weight.detach().clone()
+                        entries = dict(base._lycoris_lokr_merge_entries)
+
+                        with torch.no_grad():
+                            adapters[mutated_index].lokr_w1.add_(0.125)
+                        with self.assertRaisesRegex(RuntimeError, "factor changed"):
+                            adapters[undo_index].merge_to(
+                                -adapters[undo_index].multiplier
+                            )
+                        self.assertTrue(torch.equal(base.weight, merged_weight))
+                        self.assertEqual(
+                            base._lycoris_lokr_merge_entries,
+                            entries,
+                        )
+
+                        self.assertTrue(
+                            adapters[undo_index].resolve_merge_conflict(
+                                strategy=strategy
+                            )
+                        )
+                        self.assertFalse(hasattr(base, "_lycoris_lokr_merge_entries"))
+                        if strategy == "restore_base":
+                            self.assertTrue(torch.equal(base.weight, original_weight))
+                            self.assertFalse(
+                                getattr(first, "_lokr_merge_committed", False)
+                            )
+                            self.assertFalse(
+                                getattr(second, "_lokr_merge_committed", False)
+                            )
+                        else:
+                            self.assertTrue(torch.equal(base.weight, merged_weight))
+                            self.assertTrue(first._lokr_merge_committed)
+                            self.assertTrue(second._lokr_merge_committed)
+
+    def test_network_finalize_preflights_factor_conflicts(self):
+        first_base = nn.Linear(8, 8)
+        second_base = nn.Linear(8, 8)
+        first = self._make_full_matrix_dora(first_base)
+        second = self._make_full_matrix_dora(second_base)
+        first.merge_to(0.4)
+        second.merge_to(0.4)
+        first_merged = first_base.weight.detach().clone()
+        second_merged = second_base.weight.detach().clone()
+        with torch.no_grad():
+            second.lokr_w1.add_(0.125)
+
+        network = LycorisNetwork(nn.Sequential(), init_only=True)
+        network.loras = [first, second]
+        with self.assertRaisesRegex(RuntimeError, "factor changed"):
+            network.finalize_merge()
+
+        self.assertTrue(torch.equal(first_base.weight, first_merged))
+        self.assertTrue(torch.equal(second_base.weight, second_merged))
+        self.assertTrue(hasattr(first_base, "_lycoris_lokr_merge_entries"))
+        self.assertTrue(hasattr(second_base, "_lycoris_lokr_merge_entries"))
+        self.assertFalse(getattr(first, "_lokr_merge_committed", False))
+        self.assertFalse(getattr(second, "_lokr_merge_committed", False))
+
+        first.merge_to(-0.4)
+        second.resolve_merge_conflict(strategy="restore_base")
+
+    def test_merge_conflict_evidence_has_constant_persistent_size(self):
+        base = nn.Linear(53, 59)
+        module = self._make_full_matrix_dora(base)
+        module.merge_to(0.4)
+
+        self.assertEqual(
+            base._lycoris_lokr_merge_base.numel(),
+            base.weight.numel(),
+        )
+        self.assertIsInstance(
+            base._lycoris_lokr_merge_weight_fingerprint,
+            bytes,
+        )
+        self.assertEqual(len(base._lycoris_lokr_merge_weight_fingerprint), 32)
+        self.assertEqual(
+            set(base._lycoris_lokr_merge_adapter_fingerprints),
+            {module},
+        )
+        self.assertEqual(
+            len(base._lycoris_lokr_merge_adapter_fingerprints[module]),
+            32,
+        )
+        target_ref = base._lycoris_lokr_merge_weight_param_ref
+        self.assertIsInstance(target_ref, weakref.ReferenceType)
+        self.assertIs(target_ref(), base.weight)
+        self.assertNotIn("_lycoris_lokr_merge_weight_param", base.__dict__)
+
+        tensor_ledger_values = [
+            value
+            for name, value in base.__dict__.items()
+            if name.startswith("_lycoris_lokr_merge_")
+            and isinstance(value, torch.Tensor)
+        ]
+        self.assertEqual(tensor_ledger_values, [base._lycoris_lokr_merge_base])
+        module.merge_to(-0.4)
 
     def test_finalize_and_nonreversible_merge_release_full_weight_ledger(self):
         base = nn.Linear(8, 8)

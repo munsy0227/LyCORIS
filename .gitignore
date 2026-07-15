@@ -20,6 +20,7 @@ exps/
 *.ckpt
 test*.py
 !test/test_lokr.py
+!test/test_kohya_optimizer.py
 
 # Editors
 .vscode/

@@ -21,6 +21,7 @@
   * `restore`
   * `merge_to`
   * `finalize_merge`
+  * `resolve_merge_conflict` (LoKr only)
   * `onfly_merge`
   * `onfly_restore`
   * `get_diff_weight`
@@ -92,6 +93,29 @@ and `bypass_forward_diff`, the overall logic is the same.
 * `create_lycoris`: see example
 * `create_lycoris_from_weights`: see example
 
+For LoKr modules created with `use_scalar=True`, `network.state_dict()` preserves
+the exact LoKr adapter parameterization needed for training resume. Optimizer,
+scheduler, RNG, and other trainer state must still be checkpointed separately.
+In addition to the historical scalar-folded first factor, the adapter state
+contains versioned `_lycoris_lokr_training_*` entries for the raw first factor
+and trainable scalar. This preserves the initial `scalar=0` state and
+optimizer-compatible parameterization exactly. Factory reconstruction detects
+these entries and restores `use_scalar=True` automatically. When loading the
+state directly into a preconstructed module, that module must also use
+`use_scalar=True`; a mismatch is rejected instead of silently changing the
+optimizer parameter set.
+
+`LycorisNetwork.save_weights()` and `LycorisNetworkKohya.save_weights()` remove
+those resume-only entries and write the portable historical representation.
+Requested low save precision applies to LoKr factors, while `dora_scale` keeps
+its master dtype and `dora_zero_mask` remains boolean; these tensors are small
+and quantizing them would break the initial DoRA no-op or structural mask.
+When saving `state_dict()` directly for inference or interchange, call
+`LokrModule.strip_training_state_keys(state_dict)` first. Conversely, do not
+strip an Accelerate/PyTorch training checkpoint that must resume exactly. With
+`load_state_dict(assign=True)`, create the optimizer after loading, as required
+by the normal PyTorch Parameter-replacement contract.
+
 `LycorisNetwork.apply_to()` can be invoked multiple times with different wrapper
 instances. Multiple LoKr wrappers may share a target. An additive, non-DoRA
 LoKr may also share a target with non-DoRA LoCon, LoHa, or T-LoRA. FullModule
@@ -108,8 +132,22 @@ committed adapter cannot be applied or merged again. Restore all forward
 wrappers, remove active parametrizations, and restore on-the-fly changes before
 a destructive merge. A reversible network merge rejects mixed LoKr and other
 algorithms on one target. Do not train or otherwise mutate LoKr factors while a
-reversible merge ledger is active; undo or finalize the ledger before resuming
-factor updates.
+reversible merge ledger is active; normal partial undo and finalize operations
+fail closed if a factor or the target weight changes. Resolve such a conflict
+for the complete target ledger with exactly one explicit outcome:
+
+```python
+adapter.resolve_merge_conflict(strategy="restore_base")
+adapter.resolve_merge_conflict(strategy="adopt_current")
+```
+
+`restore_base` is available only when the target `Parameter` identity and its
+exact merged bytes are unchanged; it restores the original base and leaves the
+updated factors reusable. `adopt_current` never writes the target, keeps any
+current or externally replaced target exactly as-is, and makes every adapter in
+that target ledger terminal. Conflict recovery is intentionally target-wide:
+an old partial composition cannot be reconstructed from changed factors without
+retaining another potentially weight-sized recipe.
 
 `onfly_restore()` must run in reverse order when multiple adapters temporarily
 modify the same target. `LycorisNetwork.onfly_restore()` performs this reversal
@@ -124,3 +162,19 @@ See `example/stacked_wrapper_demo.py` for a script that showcases stacking and s
 ### kohya
 
 * the specialized wrapper for kohya-ss/sd-scripts.
+
+Optimizer preparation freezes adapters omitted by an effective zero learning
+rate and keeps that mask through `prepare_grad_etc()`, including calls made
+before adapters are registered as network children. Supported LoRA+ higher-LR
+roles are `lora_up` and `hada_w2_a`. LoKr parameters remain in the base-LR group:
+its full, Kronecker, and Tucker representations do not have one validated
+equivalent of LoRA's two-factor B matrix. Optimizers used with a non-unit LoRA+
+ratio must support different nonzero learning rates across parameter groups.
+Rebuild the optimizer after changing the effective adapter topology or
+learning-rate groups.
+
+The text-encoder/U-Net selection passed to Kohya `apply_to()` is immutable after
+the first successful call. Repeating the same selection while active is a no-op,
+and the same selection can be applied again after `restore()`. Changing the
+selection later is rejected before any wrapper or module-list mutation; create a
+new network for a different topology.

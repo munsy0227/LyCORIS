@@ -7,8 +7,9 @@ training configuration is full-matrix LoKR with DoRA. Do not narrow the goal to
 only making existing tests pass; preserve mathematical correctness, checkpoint
 compatibility, lifecycle safety, and bounded memory use.
 
-Start from commit `1109c9e` (`Harden full-matrix DoRA LoKr`). Do not redo the
-completed audit unless current code contradicts this handoff.
+Continue from the current branch HEAD. Commit `1109c9e` (`Harden full-matrix
+DoRA LoKr`) is the original hardening baseline; do not redo the completed audit
+unless current code contradicts this handoff.
 
 ## Communication and execution rules
 
@@ -32,15 +33,42 @@ The following behavior is intentional and covered by regression tests:
 - DoRA computes a normalized adapted direction and applies the runtime
   multiplier to the complete DoRA residual relative to the base weight.
 - The direction norm is detached for backward, and fp16/bf16 DoRA accumulation
-  is promoted to float32. Explicit float64 inputs remain float64.
+  is promoted to float32. The trainable magnitude remains an FP32 master across
+  full low-precision `.to()` casts without replacing an optimizer-visible
+  Parameter; explicit float64 inputs remain float64.
+- Initial exactly zero base-norm slices use a fixed checkpointed additive
+  fallback mask. This preserves the exact initial no-op while keeping a live
+  gradient; legacy/meta checkpoints derive the mask when the base materializes.
 - Linear and grouped Conv1d/2d/3d are supported. Input-axis grouped DoRA
   magnitudes are per group and local input channel.
 - Full-matrix, low-rank, Tucker, 1x1 Tucker, flattened functional Conv factors,
   mixed parameter dtypes, meta reconstruction, and `assign=True` dtype/device
   marker updates are handled explicitly.
+- Automatically promoted full first and second factors set `full_matrix=True`
+  and use unit scaling even when the user supplied only a very large rank.
+- `use_scalar=True` PyTorch state carries versioned raw-factor/scalar resume
+  data. Portable `save_weights()` exports strip it and retain the historical
+  folded representation; direct checkpoint reconstruction preserves the exact
+  scalar Parameter when resume data is present. Low-precision portable exports
+  keep DoRA magnitude/mask in their master/boolean dtypes.
+- Kohya optimizer grouping keeps all LoKr factors in the base-LR group because
+  its full, Kronecker, and Tucker forms have no validated equivalent of LoRA's
+  B role. LR-zero adapters are frozen with stale gradients cleared, and the mask
+  is stable before or after adapter registration. Registered adapters removed
+  from an active list are still frozen, and the first successful TE/U-Net apply
+  selection is immutable; identical active calls are idempotent.
 - Reversible LoKR merge uses one CPU base-weight ledger, detects target
   Parameter replacement, normal external mutation, and raw `.data` mutation by
   recomposition, and preserves adapter application order.
+- The ledger also stores chunked SHA-256 fingerprints for the exact target bytes
+  and every merge-relevant adapter value/configuration. It retains no second
+  persistent base-sized tensor, and target Parameter identity uses a weak
+  reference so replacement does not pin the old device storage.
+- Factor/config mutation fails closed for normal undo, partial undo, and
+  finalize. `resolve_merge_conflict(strategy="restore_base")` safely restores
+  the complete target ledger only when the target is untouched;
+  `strategy="adopt_current"` performs no target write and terminally adopts the
+  exact current target. Exact partial conflict recovery is intentionally absent.
 - Network finalize and on-the-fly restore preflight every target before making
   mutations. Nested LoKR on-the-fly frames are validated from top to bottom.
 - Non-reversible multi-DoRA network merge follows wrapper application order.
@@ -57,48 +85,19 @@ The following behavior is intentional and covered by regression tests:
 
 ## Highest-priority remaining LoKR issue
 
-Reversible merge recovery after factor mutation is still incomplete.
+No unresolved correctness defect is currently known in the primary full-matrix
+LoKR DoRA path. Drive the next correctness change from concrete failing evidence
+rather than weakening the lifecycle checks added here.
 
-Current ledger state in `lycoris/modules/lokr.py` stores a CPU clone of the base
-weight, adapter entries/order, precise mode, target Parameter identity, and the
-target Tensor version. Validation recomposes the expected target using the
-*current* adapter factors.
-
-Consequences:
-
-1. After `adapter.merge_to(m)`, changing any active factor makes both
-   `adapter.merge_to(-m)` and `adapter.finalize_merge()` fail even if the target
-   weight itself is untouched.
-2. Factor mutation and a raw target `.data` write can be ambiguous because the
-   target Tensor version may not change.
-3. Partial undo with multiple adapters cannot be recomposed correctly from
-   mutated factors unless the original factor state or equivalent composition
-   evidence was retained.
-
-Required properties for the next design:
-
-- Never overwrite a genuine external target-weight update silently.
-- Retain detection of Parameter replacement and raw `.data` writes.
-- Avoid another persistent base-sized tensor; full-matrix memory is a primary
-  constraint.
-- Define explicit semantics for full undo, partial undo, and finalize after
-  factor mutation. If exact partial undo is information-theoretically
-  impossible without retained state, expose a narrow, explicit recovery API
-  instead of weakening normal validation.
-- Add tests for one and multiple adapters, factor `copy_`/optimizer mutation,
-  target `no_grad` mutation, target `.data` mutation, Parameter replacement,
-  finalize, complete undo, and partial undo.
-
-Do not implement a `force=True` path that blindly overwrites the target. A safe
-explicit recovery operation must make the risk and chosen outcome unambiguous.
+The clearest remaining bounded-memory opportunity is checkpoint reconstruction:
+factor tensors are cloned to avoid aliasing the caller's state dict, so loading
+temporarily retains both checkpoint and adapter storage. Any zero-copy loader
+must expose explicit ownership transfer and must not let later caller mutation
+silently alter the adapter.
 
 ## Secondary limitations
 
-- CUDA and MPS were unavailable in the audit environment. Run the existing
-  device/dtype matrix on real hardware before declaring those paths complete.
-- Checkpoint reconstruction clones factor tensors to avoid aliasing the caller's
-  state dict. This temporarily keeps checkpoint and adapter factor storage at
-  the same time. Any zero-copy loader must make ownership transfer explicit.
+- MPS remains unverified on matching hardware.
 - Generic non-LoKR on-the-fly adapters still rely primarily on Tensor `_version`
   and may miss direct `.data` writes. LoKR itself uses value recomposition.
 - Earlier broad project runs had unrelated failures: 10 LoRA/LoHa wrapper
@@ -117,17 +116,32 @@ explicit recovery operation must make the risk and chosen outcome unambiguous.
 - `lycoris/utils/quant.py`: Quanto and bitsandbytes dequantization.
 - `test/lokr.py`: focused regression suite.
 - `test/test_lokr.py`: standard unittest discovery entry point.
+- `test/test_kohya_optimizer.py`: Kohya optimizer grouping, freezing, and
+  `apply_to()` lifecycle regressions.
 
 ## Last verified test evidence
 
-On 2026-07-15, before the temporary environments were deleted:
+On 2026-07-15, after the final LoKr audit:
 
-- 102 focused LoKR tests passed under Python 3.12, PyTorch 2.13.0+cpu,
+- 140 focused LoKR tests plus 10 Kohya optimizer-lifecycle tests passed under
+  Python 3.12.13, PyTorch 2.13.0+cu130,
   optimum-quanto 0.2.7, and bitsandbytes 0.49.2, with no skips.
-- 96 LoKR module combinations, 4 functional LoKR cases, 8 wrapper LoKR cases,
-  and 32 affected FullModule combinations passed.
-- Relevant Ruff checks, Ruff format checks, `compileall`, and
-  `git diff --check` passed.
+- On an NVIDIA GeForce RTX 4070, 384 LoKR module combinations and 16 functional
+  LoKR cases passed across CPU/CUDA float32, CUDA float16, and CUDA bfloat16.
+- All 32 LoKR wrapper device/dtype/config combinations passed. The wrapper test
+  now restores the reversible LoKR merge before applying a reconstructed DoRA
+  checkpoint, so it compares both adapters on the same base instead of applying
+  the base-dependent normalization twice.
+- CUDA edge tests passed for FP32/FP16/BF16 zero-base learning, both DoRA norm
+  axes, `use_scalar` on/off, FP32 magnitude preservation, initial bitwise no-op,
+  and optimizer Parameter identity on an NVIDIA GeForce RTX 4070.
+- Twenty-four nonzero full-matrix DoRA CUDA combinations covering Linear,
+  grouped Conv1d/2d/3d, both magnitude axes, and all three CUDA dtypes produced
+  exact merged weights, exact undo, and bitwise-equal checkpoint reconstruction.
+- The new `restore_base` and `adopt_current` conflict outcomes passed directly on
+  CUDA for float32, float16, and bfloat16.
+- Relevant Ruff checks and format checks, `compileall`, and `git diff --check`
+  passed on the final source.
 
 Use a low-memory invocation pattern such as:
 
@@ -137,7 +151,7 @@ env OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
     PYTHONPATH=. \
-    python -m unittest discover -s test -p 'test_lokr.py'
+    python -m unittest -q test.lokr test.test_kohya_optimizer
 ```
 
 The previous temporary virtual environments and caches under `/tmp` were

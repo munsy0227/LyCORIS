@@ -17,6 +17,7 @@ from .wrapper import (
     normalize_module_options,
 )
 from .modules.glora import GLoRAModule
+from .modules.lokr import LokrModule
 from .modules.norms import NormModule
 from .modules import make_module, get_module
 
@@ -875,6 +876,18 @@ class LycorisNetworkKohya(LycorisNetwork):
             "internal error: flag not set"
         )
 
+        selection = (bool(apply_text_encoder), bool(apply_unet))
+        previous_selection = getattr(self, "_applied_selection", None)
+        if previous_selection is not None:
+            if previous_selection != selection:
+                raise RuntimeError(
+                    "LyCORIS apply selection cannot be changed after the first "
+                    "successful apply_to call. Create a new network to use "
+                    "different text-encoder or U-Net selection flags."
+                )
+            if getattr(self, "_apply_is_active", False):
+                return
+
         if apply_text_encoder:
             logger.info("enable LyCORIS for text encoder")
         else:
@@ -895,6 +908,13 @@ class LycorisNetworkKohya(LycorisNetwork):
             # if some weights are not in state dict, it is ok because initial LoRA does nothing (lora_up is initialized by zeros)
             info = self.load_state_dict(self.weights_sd, False)
             logger.info(f"weights are loaded: {info}")
+
+        self._applied_selection = selection
+        self._apply_is_active = True
+
+    def restore(self):
+        super().restore()
+        self._apply_is_active = False
 
     # TODO refactor to common function with apply_to
     def merge_to(self, text_encoder, unet, weights_sd, dtype, device):
@@ -949,10 +969,46 @@ class LycorisNetworkKohya(LycorisNetwork):
             f"{self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}"
         )
 
+    @staticmethod
+    def _is_plus_param(name: str) -> bool:
+        """Return whether ``name`` belongs to the higher-LR LoRA+ group."""
+        # LoRA+ defines a higher LR for the B matrix of a two-factor LoRA.
+        # LoKr's Kronecker/full/Tucker representations have no single, proven
+        # equivalent role, so keep every LoKr parameter in the base-LR group.
+        return "lora_up" in name or "hada_w2_a" in name
+
+    def _iter_adapter_parameters(self):
+        adapters = list(self.text_encoder_loras) + list(self.unet_loras)
+        adapters.extend(
+            child for child in self.children() if hasattr(child, "lora_name")
+        )
+
+        seen = set()
+        for adapter in adapters:
+            for param in adapter.parameters():
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                yield param
+
+    def _apply_optimizer_trainable_mask(self):
+        trainable_ids = getattr(self, "_optimizer_trainable_param_ids", None)
+        if trainable_ids is None:
+            for param in self._iter_adapter_parameters():
+                param.requires_grad_(True)
+            return
+
+        for param in self._iter_adapter_parameters():
+            is_trainable = id(param) in trainable_ids
+            param.requires_grad_(is_trainable)
+            if not is_trainable:
+                param.grad = None
+
     def prepare_optimizer_params(
         self, text_encoder_lr=None, unet_lr: float = 1e-4, learning_rate=None
     ):
-        self.requires_grad_(True)
+        for param in self._iter_adapter_parameters():
+            param.requires_grad_(True)
 
         all_params = []
         lr_descriptions = []
@@ -986,7 +1042,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                                 "plus": {},
                                 "lr": reg_lr,
                             }
-                        if ratio is not None and "lora_up" in name:
+                        if ratio is not None and self._is_plus_param(name):
                             reg_groups[group_key]["plus"][
                                 f"{lora.lora_name}.{name}"
                             ] = param
@@ -996,7 +1052,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                             ] = param
                         continue
 
-                    if ratio is not None and "lora_up" in name:
+                    if ratio is not None and self._is_plus_param(name):
                         param_groups["plus"][f"{lora.lora_name}.{name}"] = param
                     else:
                         param_groups["lora"][f"{lora.lora_name}.{name}"] = param
@@ -1007,7 +1063,7 @@ class LycorisNetworkKohya(LycorisNetwork):
             for group_key, group in reg_groups.items():
                 reg_lr = group["lr"]
                 for key in ("lora", "plus"):
-                    param_data = {"params": group[key].values()}
+                    param_data = {"params": list(group[key].values())}
                     if len(param_data["params"]) == 0:
                         continue
                     if key == "plus":
@@ -1028,7 +1084,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                     descriptions.append(desc + (" plus" if key == "plus" else ""))
 
             for key in param_groups.keys():
-                param_data = {"params": param_groups[key].values()}
+                param_data = {"params": list(param_groups[key].values())}
 
                 if len(param_data["params"]) == 0:
                     continue
@@ -1073,6 +1129,12 @@ class LycorisNetworkKohya(LycorisNetwork):
                 ["unet" + (" " + d if d else "") for d in descriptions]
             )
 
+        trainable_param_ids = {
+            id(param) for group in all_params for param in group["params"]
+        }
+        self._optimizer_trainable_param_ids = frozenset(trainable_param_ids)
+        self._apply_optimizer_trainable_mask()
+
         return all_params, lr_descriptions
 
     def enable_gradient_checkpointing(self):
@@ -1080,7 +1142,7 @@ class LycorisNetworkKohya(LycorisNetwork):
         pass
 
     def prepare_grad_etc(self, *args):
-        self.requires_grad_(True)
+        self._apply_optimizer_trainable_mask()
 
     def on_epoch_start(self, *args):
         self.train()
@@ -1089,18 +1151,27 @@ class LycorisNetworkKohya(LycorisNetwork):
         pass
 
     def get_trainable_params(self):
-        return self.parameters()
+        trainable_ids = getattr(self, "_optimizer_trainable_param_ids", None)
+        return (
+            param
+            for param in self._iter_adapter_parameters()
+            if param.requires_grad
+            and (trainable_ids is None or id(param) in trainable_ids)
+        )
 
     def save_weights(self, file, dtype, metadata):
         if metadata is not None and len(metadata) == 0:
             metadata = None
 
         state_dict = self.state_dict()
+        LokrModule.strip_training_state_keys(state_dict)
 
         if dtype is not None:
+            master_dtype_keys = LokrModule.export_master_dtype_keys(state_dict)
             for key in list(state_dict.keys()):
                 v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                target_dtype = v.dtype if key in master_dtype_keys else dtype
+                v = v.detach().clone().to("cpu").to(target_dtype)
                 state_dict[key] = v
 
         if os.path.splitext(file)[1] == ".safetensors":

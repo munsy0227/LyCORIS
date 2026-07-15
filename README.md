@@ -245,7 +245,13 @@ the original-weight snapshot. `restore()` only removes forward wrappers and does
 not undo an already merged weight. Restore forward wrappers, parametrizations,
 and on-the-fly changes before a destructive merge. Finalized or non-reversible
 adapters are committed and cannot be reused. Undo or finalize a reversible
-LoKr ledger before updating that adapter's factors again. See the
+LoKr ledger before updating that adapter's factors again. If factors or the
+target were changed while the ledger was active, normal undo and finalize fail
+closed. Use `resolve_merge_conflict(strategy="restore_base")` to restore the
+whole target ledger only when the merged target itself is untouched, or
+`strategy="adopt_current"` to keep the exact current target without writing it
+and make all adapters in that ledger terminal. Partial conflict recovery is not
+supported. See the
 [high-precision merge example](example/high_precision_merge_demo.py) for the
 merge/unmerge sequence.
 

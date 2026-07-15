@@ -210,9 +210,27 @@ class LycorisWrapperTests(unittest.TestCase):
             test_input = torch.randn(1, 16, 8, 8, 8).to(device, dtype)
             test_output = test_net(test_input)
             test_lycoris.restore()
+            lokr_base_state = (
+                {
+                    name: parameter.detach().clone()
+                    for name, parameter in test_net.named_parameters()
+                }
+                if algo == "lokr"
+                else None
+            )
             test_lycoris.merge_to()
 
             state_dict = test_lycoris.state_dict()
+            if algo == "lokr":
+                # A reconstructed DoRA adapter must be compared on the same base.
+                # Leaving LoKr merged here would apply the checkpoint twice; low
+                # precision makes that unintended second normalization observable.
+                test_lycoris.merge_to(-1.0)
+                for name, parameter in test_net.named_parameters():
+                    self.assertTrue(
+                        torch.equal(parameter, lokr_base_state[name]),
+                        f"LoKr reversible merge did not exactly restore {name}.",
+                    )
             test_lycoris_from_weights: LycorisNetwork
             test_lycoris_from_weights, _ = create_lycoris_from_weights(
                 1, None, test_net, state_dict

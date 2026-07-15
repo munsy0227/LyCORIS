@@ -991,11 +991,14 @@ class LycorisNetwork(torch.nn.Module):
             metadata = None
 
         state_dict = self.state_dict()
+        LokrModule.strip_training_state_keys(state_dict)
 
         if dtype is not None:
+            master_dtype_keys = LokrModule.export_master_dtype_keys(state_dict)
             for key in list(state_dict.keys()):
                 v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                target_dtype = v.dtype if key in master_dtype_keys else dtype
+                v = v.detach().clone().to("cpu").to(target_dtype)
                 state_dict[key] = v
 
         if os.path.splitext(file)[1] == ".safetensors":

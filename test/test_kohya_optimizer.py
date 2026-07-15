@@ -3,8 +3,231 @@ import unittest
 import torch
 from torch import nn
 
-from lycoris.kohya import LycorisNetworkKohya
+from lycoris.kohya import LycorisNetworkKohya, create_network
 from lycoris.modules import LoConModule, LohaModule, LokrModule
+
+
+class _AnimaAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(4, 4, bias=False)
+        self.k_proj = nn.Linear(4, 4, bias=False)
+        self.v_proj = nn.Linear(4, 4, bias=False)
+        self.output_proj = nn.Linear(4, 4, bias=False)
+
+
+class _AnimaMlp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer1 = nn.Linear(4, 8, bias=False)
+        self.layer2 = nn.Linear(8, 4, bias=False)
+
+
+def _anima_modulation():
+    return nn.Sequential(
+        nn.SiLU(),
+        nn.Linear(4, 4, bias=False),
+        nn.Linear(4, 12, bias=False),
+    )
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer_norm_self_attn = nn.LayerNorm(4, elementwise_affine=False)
+        self.adaln_modulation_cross_attn = _anima_modulation()
+        self.adaln_modulation_mlp = _anima_modulation()
+        self.adaln_modulation_self_attn = _anima_modulation()
+        self.cross_attn = _AnimaAttention()
+        self.layer_norm_cross_attn = nn.LayerNorm(4, elementwise_affine=False)
+        self.layer_norm_mlp = nn.LayerNorm(4, elementwise_affine=False)
+        self.mlp = _AnimaMlp()
+        self.self_attn = _AnimaAttention()
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_1 = nn.Linear(4, 4, bias=False)
+        self.linear_2 = nn.Linear(4, 4, bias=False)
+
+
+class FinalLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4, bias=False)
+
+
+class LLMAdapterTransformerBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+
+
+class _LLMAdapter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([LLMAdapterTransformerBlock()])
+
+
+class Anima(nn.Module):
+    def __init__(self, block_count):
+        super().__init__()
+        self.blocks = nn.ModuleList(Block() for _ in range(block_count))
+        self.x_embedder = PatchEmbed()
+        self.t_embedder = TimestepEmbedding()
+        self.final_layer = FinalLayer()
+        self.llm_adapter = _LLMAdapter()
+
+
+class Qwen3Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(4, 4, bias=False)
+        self.k_proj = nn.Linear(4, 4, bias=False)
+        self.v_proj = nn.Linear(4, 4, bias=False)
+        self.o_proj = nn.Linear(4, 4, bias=False)
+
+
+class _AnimaTextEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention = Qwen3Attention()
+
+
+class AnimaOfficialScopeTests(unittest.TestCase):
+    _PRESET_STATE_FIELDS = (
+        "ENABLE_CONV",
+        "UNET_TARGET_REPLACE_MODULE",
+        "UNET_TARGET_REPLACE_NAME",
+        "TEXT_ENCODER_TARGET_REPLACE_MODULE",
+        "TEXT_ENCODER_TARGET_REPLACE_NAME",
+        "MODULE_ALGO_MAP",
+        "NAME_ALGO_MAP",
+        "USE_FNMATCH",
+    )
+    OFFICIAL_BLOCK_SUFFIXES = (
+        "adaln_modulation_cross_attn.1",
+        "adaln_modulation_cross_attn.2",
+        "adaln_modulation_mlp.1",
+        "adaln_modulation_mlp.2",
+        "adaln_modulation_self_attn.1",
+        "adaln_modulation_self_attn.2",
+        "cross_attn.q_proj",
+        "cross_attn.k_proj",
+        "cross_attn.v_proj",
+        "cross_attn.output_proj",
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.output_proj",
+        "mlp.layer1",
+        "mlp.layer2",
+    )
+
+    def setUp(self):
+        self._preset_state = {
+            field: getattr(LycorisNetworkKohya, field)
+            for field in self._PRESET_STATE_FIELDS
+        }
+        LycorisNetworkKohya.MODULE_ALGO_MAP = {}
+        LycorisNetworkKohya.NAME_ALGO_MAP = {}
+        LycorisNetworkKohya.USE_FNMATCH = False
+
+    @staticmethod
+    def _create_network(block_count=28, **kwargs):
+        text_encoder = _AnimaTextEncoder()
+        unet = Anima(block_count)
+        network = create_network(
+            1.0,
+            4,
+            1.0,
+            None,
+            text_encoder,
+            unet,
+            algo="lokr",
+            preset="full",
+            factor=4,
+            dora_wd=True,
+            use_scalar=True,
+            train_llm_adapter=False,
+            warn_on_unmatched=False,
+            **kwargs,
+        )
+        return network, text_encoder, unet
+
+    def tearDown(self):
+        for field, value in self._preset_state.items():
+            setattr(LycorisNetworkKohya, field, value)
+
+    def test_anima_full_preset_matches_official_diffusion_module_scope(self):
+        network, text_encoder, unet = self._create_network(train_norm=True)
+        expected_names = {
+            f"blocks.{block_index}.{suffix}"
+            for block_index in range(28)
+            for suffix in self.OFFICIAL_BLOCK_SUFFIXES
+        }
+        actual_names = {lora.original_name for lora in network.unet_loras}
+
+        self.assertEqual(len(network.unet_loras), 448)
+        self.assertEqual(actual_names, expected_names)
+        self.assertTrue(
+            all(isinstance(lora, LokrModule) for lora in network.unet_loras)
+        )
+        self.assertTrue(
+            all(
+                isinstance(lora.org_module[0], nn.Linear) for lora in network.unet_loras
+            )
+        )
+
+        # sd-scripts' network_train_unet_only=true maps to this selection.
+        self.assertGreater(len(network.text_encoder_loras), 0)
+        try:
+            network.apply_to(text_encoder, unet, False, True)
+            self.assertEqual(network.text_encoder_loras, [])
+            self.assertEqual(len(network.loras), 448)
+            self.assertFalse(
+                any(key.startswith("lora_te") for key in network.state_dict())
+            )
+        finally:
+            network.restore()
+
+    def test_anima_patterns_are_forwarded_and_can_override_default_scope(self):
+        network, _, _ = self._create_network(
+            block_count=1,
+            exclude_patterns=[r".*self_attn.*"],
+            include_patterns=[r".*final_layer.*"],
+        )
+        expected_names = {
+            f"blocks.0.{suffix}"
+            for suffix in self.OFFICIAL_BLOCK_SUFFIXES
+            if "self_attn" not in suffix
+        }
+        expected_names.add("final_layer.linear")
+
+        self.assertEqual(
+            {lora.original_name for lora in network.unet_loras}, expected_names
+        )
+
+    def test_user_dimension_patterns_cover_every_official_block_target(self):
+        network, _, _ = self._create_network(
+            block_count=1,
+            network_reg_dims=(
+                r".*self\_attn.*=100000,"
+                r".*cross\_attn.*=100000,"
+                r".*mlp.*=100000"
+            ),
+        )
+
+        self.assertEqual(len(network.unet_loras), 16)
+        self.assertTrue(all(lora.lora_dim == 100000 for lora in network.unet_loras))
+        self.assertTrue(all(lora.full_matrix for lora in network.unet_loras))
 
 
 class KohyaOptimizerParamTests(unittest.TestCase):

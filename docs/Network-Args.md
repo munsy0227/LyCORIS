@@ -15,6 +15,27 @@ Arguments to put in `network_args` for kohya sd scripts
 - Use `preset=xxx.toml` to choose config file (for LyCORIS module settings)
 - More info in [Preset](Preset.md)
 
+### Anima official diffusion scope
+
+- With an Anima model and the `full` preset, LyCORIS targets the same diffusion
+  Block Linear-module range found in the official Anima style LoRA: the six
+  `adaln_modulation_*` projections, four self-attention projections, four
+  cross-attention projections, and two MLP projections in every Block.
+- Norm, embedder, final-layer, and LLM-adapter modules remain excluded by
+  default. Set `train_llm_adapter=True` only when that additional adapter is
+  intentionally part of the training scope.
+- The official style LoRA is diffusion-only. In sd-scripts, set
+  `network_train_unet_only=true` to reproduce that boundary. A zero
+  `text_encoder_lr` freezes text-encoder adapters but does not prevent them from
+  being registered and saved.
+- LoKr uses Kronecker factors, optional DoRA state, and an optional scalar, so
+  matching the base Linear-module range does not imply matching LoRA tensor
+  names, shapes, rank, or tensor count.
+- `include_patterns` and `exclude_patterns` can override or narrow the default
+  scope and are forwarded by `create_network()`. `network_reg_dims` only
+  changes the dimension of modules already selected; it does not select the
+  training scope.
+
 ### Dimension
 
 - Dimension of the linear layers is set with the _script argument_ `network_dim`

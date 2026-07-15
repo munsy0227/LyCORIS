@@ -27,7 +27,10 @@ from .utils import str_bool
 from .logging import logger
 
 
-ANIMA_DEFAULT_EXCLUDE_PATTERNS = (r".*(_modulation|_norm|_embedder|final_layer).*",)
+# The official Anima LoRA covers every Linear in each diffusion Block,
+# including the six AdaLN modulation projections.  Norm, embedder, and final
+# layers remain outside that diffusion-block adapter scope.
+ANIMA_DEFAULT_EXCLUDE_PATTERNS = (r".*(_norm|_embedder|final_layer).*",)
 ANIMA_REQUIRED_MODULE_CLASSES = {"Block", "PatchEmbed", "TimestepEmbedding"}
 
 
@@ -243,6 +246,8 @@ def create_network(
         reg_dims=reg_dims,
         reg_lrs=reg_lrs,
         is_anima_model=is_anima_model,
+        include_patterns=kwargs.get("include_patterns", None),
+        exclude_patterns=kwargs.get("exclude_patterns", None),
     )
     if (
         loraplus_lr_ratio is not None

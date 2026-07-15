@@ -57,6 +57,13 @@ The following behavior is intentional and covered by regression tests:
   is stable before or after adapter registration. Registered adapters removed
   from an active list are still frozen, and the first successful TE/U-Net apply
   selection is immutable; identical active calls are idempotent.
+- Anima's `full` preset matches the official diffusion-only LoRA target range:
+  all 16 Linear modules in each of 28 Blocks, including the six AdaLN
+  modulation projections (448 adapters total). Norm, embedder, final-layer, and
+  LLM-adapter modules remain excluded by default. Use sd-scripts'
+  `network_train_unet_only=true` to omit text-encoder adapters entirely; a zero
+  text-encoder LR only freezes them. Kohya `include_patterns` and
+  `exclude_patterns` are forwarded so explicit scope overrides still work.
 - Reversible LoKR merge uses one CPU base-weight ledger, detects target
   Parameter replacement, normal external mutation, and raw `.data` mutation by
   recomposition, and preserves adapter application order.
@@ -123,9 +130,16 @@ silently alter the adapter.
 
 On 2026-07-15, after the final LoKr audit:
 
-- 140 focused LoKR tests plus 10 Kohya optimizer-lifecycle tests passed under
+- 140 focused LoKR tests plus 13 Kohya optimizer/scope tests passed under
   Python 3.12.13, PyTorch 2.13.0+cu130,
   optimum-quanto 0.2.7, and bitsandbytes 0.49.2, with no skips.
+- The Anima scope regression constructs all 28 diffusion Blocks and verifies
+  the exact official 448-module set, diffusion-only application, and pattern
+  overrides.
+- An RTX 4070 BF16 smoke test applied all 448 mock Anima adapters with the
+  user's `network_dim=100000`, `factor=4`, DoRA, scalar, and regex-dimension
+  settings. It preserved the exact initial no-op, produced a finite scalar
+  gradient, and changed the selected AdaLN output after one optimizer step.
 - On an NVIDIA GeForce RTX 4070, 384 LoKR module combinations and 16 functional
   LoKR cases passed across CPU/CUDA float32, CUDA float16, and CUDA bfloat16.
 - All 32 LoKR wrapper device/dtype/config combinations passed. The wrapper test

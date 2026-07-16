@@ -62,8 +62,6 @@ class LokrModule(LycorisBaseModule):
         "lokr_t2",
         "alpha",
         "dora_scale",
-        "lokr_residual_scale",
-        "dora_zero_mask",
         _TRAINING_STATE_VERSION_KEY,
         _TRAINING_STATE_SCALAR_KEY,
         _TRAINING_STATE_W1_KEY,
@@ -93,7 +91,6 @@ class LokrModule(LycorisBaseModule):
         rs_lora=False,
         unbalanced_factorization=False,
         _dora_scale=None,
-        _dora_zero_mask=None,
         **kwargs,
     ):
         try:
@@ -273,26 +270,6 @@ class LokrModule(LycorisBaseModule):
                 magnitude = initial_magnitude.to(adapter_device)
             self.dora_scale = nn.Parameter(magnitude)
 
-            if _dora_zero_mask is None:
-                zero_mask = (
-                    torch.zeros_like(magnitude, dtype=torch.bool)
-                    if initial_magnitude is None
-                    else initial_magnitude == 0
-                )
-                self._dora_zero_mask_pending = initial_magnitude is None
-            else:
-                self._validate_dora_zero_mask(
-                    org_module,
-                    _dora_zero_mask,
-                    magnitude,
-                )
-                zero_mask = _dora_zero_mask.detach().to(dtype=torch.bool)
-                self._dora_zero_mask_pending = False
-            self.register_buffer(
-                "dora_zero_mask",
-                zero_mask.to(device=self.dora_scale.device),
-            )
-
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.rank_dropout_scale = rank_dropout_scale
@@ -329,7 +306,6 @@ class LokrModule(LycorisBaseModule):
             self.scalar = nn.Parameter(torch.tensor(0.0))
         else:
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
-        self.register_buffer("lokr_residual_scale", torch.tensor(1.0))
 
         if self.use_w2:
             if use_scalar:
@@ -433,31 +409,6 @@ class LokrModule(LycorisBaseModule):
                 f"{sorted(valid_shapes)}."
             )
 
-    @classmethod
-    def _validate_dora_zero_mask(
-        cls,
-        orig_module,
-        dora_zero_mask,
-        dora_scale=None,
-    ):
-        if not isinstance(dora_zero_mask, torch.Tensor):
-            raise TypeError("dora_zero_mask must be a Tensor.")
-        valid_shapes = {
-            shape for shape in cls._dora_scale_shapes(orig_module) if shape is not None
-        }
-        mask_shape = tuple(dora_zero_mask.shape)
-        if mask_shape not in valid_shapes:
-            raise ValueError(
-                "Invalid dora_zero_mask shape for target weight: "
-                f"weight={cls._target_weight_shape(orig_module)}, "
-                f"mask={mask_shape}, expected one of {sorted(valid_shapes)}."
-            )
-        if dora_scale is not None and mask_shape != tuple(dora_scale.shape):
-            raise ValueError(
-                "dora_zero_mask must exactly match dora_scale: "
-                f"mask={mask_shape}, dora_scale={tuple(dora_scale.shape)}."
-            )
-
     def _initial_dora_magnitude(self, orig_module, org_weight):
         compute_dtype = self._dora_accumulator_dtype(org_weight.dtype)
         direction = org_weight.to(dtype=compute_dtype)
@@ -489,41 +440,6 @@ class LokrModule(LycorisBaseModule):
             dim=norm_dims,
             keepdim=True,
         )
-
-    @torch.no_grad()
-    def _resolve_dora_zero_mask(self, base_weight):
-        if not getattr(self, "_dora_zero_mask_pending", False):
-            return self.dora_zero_mask
-        if base_weight.is_meta:
-            raise RuntimeError(
-                "LoKr DoRA cannot derive a legacy zero-norm mask from an "
-                "unmaterialized base weight."
-            )
-
-        zero_mask = (
-            self._initial_dora_magnitude(
-                self.org_module[0],
-                base_weight,
-            )
-            == 0
-        )
-        if tuple(zero_mask.shape) != tuple(self.dora_zero_mask.shape):
-            raise RuntimeError(
-                "Derived dora_zero_mask does not match the checkpoint magnitude: "
-                f"mask={tuple(zero_mask.shape)}, "
-                f"dora_scale={tuple(self.dora_scale.shape)}."
-            )
-        if self.dora_zero_mask.is_meta:
-            self.dora_zero_mask = zero_mask.to(
-                device=self.dora_scale.device,
-                dtype=torch.bool,
-            )
-        else:
-            self.dora_zero_mask.copy_(
-                zero_mask.to(device=self.dora_zero_mask.device, dtype=torch.bool)
-            )
-        self._dora_zero_mask_pending = False
-        return self.dora_zero_mask
 
     @classmethod
     def _infer_factorization_config(
@@ -604,8 +520,6 @@ class LokrModule(LycorisBaseModule):
         t2,
         alpha,
         dora_scale,
-        residual_scale=None,
-        dora_zero_mask=None,
         training_version=None,
         training_scalar=None,
         training_w1=None,
@@ -699,19 +613,6 @@ class LokrModule(LycorisBaseModule):
             )
         if alpha is None or (isinstance(alpha, torch.Tensor) and alpha.numel() != 1):
             raise ValueError("A LoKr checkpoint must contain a scalar alpha.")
-        if residual_scale is not None and (
-            not isinstance(residual_scale, torch.Tensor) or residual_scale.numel() != 1
-        ):
-            raise ValueError("lokr_residual_scale must be a scalar tensor.")
-        if dora_zero_mask is not None:
-            if dora_scale is None:
-                raise ValueError("dora_zero_mask requires a dora_scale tensor.")
-            cls._validate_dora_zero_mask(
-                orig_module,
-                dora_zero_mask,
-                dora_scale,
-            )
-
         if w1 is not None:
             if w1.dim() != 2:
                 raise ValueError(f"lokr_w1 must be 2D, got {tuple(w1.shape)}.")
@@ -847,7 +748,6 @@ class LokrModule(LycorisBaseModule):
                 unbalanced_factorization=unbalanced_factorization,
                 use_scalar=has_training_state,
                 _dora_scale=dora_scale,
-                _dora_zero_mask=dora_zero_mask,
             )
 
         # The checkpoint representation is authoritative. Constructor rank
@@ -912,10 +812,6 @@ class LokrModule(LycorisBaseModule):
         else:
             module.scalar = reference.new_ones(())
         module.dtype_tensor = reference.new_zeros(())
-        if residual_scale is not None:
-            module.lokr_residual_scale = residual_scale.detach().clone()
-        else:
-            module.lokr_residual_scale = reference.new_ones(())
         if isinstance(alpha, torch.Tensor):
             module.alpha = alpha.detach().clone()
         else:
@@ -980,7 +876,7 @@ class LokrModule(LycorisBaseModule):
             key
             for key in state_dict
             if key.rpartition(".")[0] in lokr_prefixes
-            and key.rpartition(".")[2] in {"dora_scale", "dora_zero_mask"}
+            and key.rpartition(".")[2] == "dora_scale"
         }
 
     @torch.no_grad()
@@ -1090,13 +986,6 @@ class LokrModule(LycorisBaseModule):
             ),
             None,
         )
-        residual_key = f"{prefix}lokr_residual_scale"
-        if residual_key not in state_dict:
-            state_dict[residual_key] = (
-                reference.new_ones(())
-                if reference is not None
-                else torch.ones_like(self.lokr_residual_scale)
-            )
         if self.wd:
             dora_scale_key = f"{prefix}dora_scale"
             checkpoint_magnitude = state_dict.get(dora_scale_key)
@@ -1108,42 +997,6 @@ class LokrModule(LycorisBaseModule):
                 state_dict[dora_scale_key] = checkpoint_magnitude.to(
                     dtype=self._dora_accumulator_dtype(checkpoint_magnitude.dtype)
                 )
-            zero_mask_key = f"{prefix}dora_zero_mask"
-            if zero_mask_key not in state_dict:
-                base_weight = self._current_weight()
-                if base_weight.is_meta:
-                    state_dict[zero_mask_key] = torch.zeros_like(
-                        self.dora_zero_mask,
-                        dtype=torch.bool,
-                    )
-                    self._dora_zero_mask_pending = True
-                else:
-                    derived_mask = (
-                        self._initial_dora_magnitude(
-                            self.org_module[0],
-                            base_weight,
-                        )
-                        == 0
-                    )
-                    if self.dora_zero_mask.is_meta:
-                        derived_mask = derived_mask.to(dtype=torch.bool)
-                    else:
-                        derived_mask = derived_mask.to(
-                            device=self.dora_zero_mask.device,
-                            dtype=torch.bool,
-                        )
-                        self.dora_zero_mask.copy_(derived_mask)
-                    state_dict[zero_mask_key] = derived_mask
-                    self._dora_zero_mask_pending = self.dora_zero_mask.is_meta
-            else:
-                zero_mask = state_dict[zero_mask_key]
-                self._validate_dora_zero_mask(
-                    self.org_module[0],
-                    zero_mask,
-                    state_dict.get(dora_scale_key, self.dora_scale),
-                )
-                state_dict[zero_mask_key] = zero_mask.to(dtype=torch.bool)
-                self._dora_zero_mask_pending = False
 
         if not has_training_state:
             # Portable LoKr checkpoints fold the scalar into the first factor.
@@ -1280,19 +1133,13 @@ class LokrModule(LycorisBaseModule):
             compute_dtype,
         )
 
-        residual_scale = self.lokr_residual_scale.to(
-            device=base_weight.device,
-            dtype=base_weight.dtype,
-        )
-        effective_multiplier = multiplier * residual_scale
-
         if self.wd:
             return self.apply_weight_decompose(
                 base_weight + diff,
-                effective_multiplier,
+                multiplier,
                 base_weight=base_weight,
             )
-        return base_weight + diff * effective_multiplier
+        return base_weight + diff * multiplier
 
     def get_diff_weight(self, multiplier=1, shape=None, device=None):
         base_weight = self._current_weight()
@@ -1340,8 +1187,6 @@ class LokrModule(LycorisBaseModule):
                 "Stacking LoKr with this adapter on the same target is not "
                 "supported because the composition is base- or order-dependent."
             )
-        if self.wd and getattr(self, "_dora_zero_mask_pending", False):
-            self._resolve_dora_zero_mask(self._current_weight())
         already_applied = self in wrappers
         super().apply_to(**kwargs)
         if not already_applied and self in getattr(module, "_lycoris_wrappers", []):
@@ -1450,8 +1295,6 @@ class LokrModule(LycorisBaseModule):
             "lokr_t2",
             "scalar",
             "dora_scale",
-            "dora_zero_mask",
-            "lokr_residual_scale",
         ):
             digest.update(name.encode("utf-8"))
             tensor = getattr(self, name, None)
@@ -1803,13 +1646,6 @@ class LokrModule(LycorisBaseModule):
                 self._clear_merge_ledger(module)
             return
 
-        for adapter in entries:
-            if adapter.wd and getattr(
-                adapter,
-                "_dora_zero_mask_pending",
-                False,
-            ):
-                adapter._resolve_dora_zero_mask(merge_base)
         adapter_fingerprints = {
             adapter: adapter._merge_state_fingerprint() for adapter in entries
         }
@@ -2027,22 +1863,9 @@ class LokrModule(LycorisBaseModule):
         direction_norm = direction_norm.clamp_min(
             torch.finfo(direction.dtype).tiny
         ).detach()
-        normalized_direction = scaled_direction * (magnitude / direction_norm)
-        zero_mask = self._resolve_dora_zero_mask(base_weight).to(
-            device=direction.device,
-            dtype=torch.bool,
+        dora_weight = (scaled_direction * (magnitude / direction_norm)).reshape_as(
+            direction
         )
-        if tuple(zero_mask.shape) != magnitude_shape:
-            raise RuntimeError(
-                "dora_zero_mask no longer matches dora_scale: "
-                f"mask={tuple(zero_mask.shape)}, dora_scale={magnitude_shape}."
-            )
-        dora_weight = torch.where(
-            zero_mask,
-            scaled_direction,
-            normalized_direction,
-        )
-        dora_weight = dora_weight.reshape_as(direction)
 
         base_weight = base_weight.to(dora_weight)
         # The runtime multiplier scales the complete DoRA adapter residual.
@@ -2051,18 +1874,8 @@ class LokrModule(LycorisBaseModule):
     def custom_state_dict(self):
         destination = {}
         destination["alpha"] = self.alpha
-        destination["lokr_residual_scale"] = self.lokr_residual_scale
         if self.wd:
-            if getattr(self, "_dora_zero_mask_pending", False):
-                base_weight = self._current_weight()
-                if not base_weight.is_meta:
-                    self._resolve_dora_zero_mask(base_weight)
             destination["dora_scale"] = self.dora_scale
-            # The mask records initialization-time semantics, not merely an
-            # optimization for zero-valued slices.  Omitting an all-false mask
-            # would make a new checkpoint indistinguishable from a legacy one,
-            # whose mask must be derived from the base at load time.
-            destination["dora_zero_mask"] = self.dora_zero_mask
         if self.use_w1:
             destination["lokr_w1"] = self.lokr_w1 * self.scalar
         else:
@@ -2111,77 +1924,72 @@ class LokrModule(LycorisBaseModule):
         if device is not None:
             base_weight = base_weight.to(device)
         was_training = self.training
-        original_scale = self.lokr_residual_scale.detach().clone()
+        original_scalar = self.scalar.detach().clone()
 
-        def stored_scale_candidate(target_cpu):
+        def stored_scalar_candidate(target_cpu):
             target_cpu = target_cpu.detach().to(device="cpu", dtype=torch.float64)
-            candidate_cpu = target_cpu.to(dtype=self.lokr_residual_scale.dtype)
+            candidate_cpu = target_cpu.to(dtype=self.scalar.dtype)
             if torch.abs(candidate_cpu.to(torch.float64)) > torch.abs(target_cpu):
                 candidate_cpu = torch.nextafter(
                     candidate_cpu,
                     torch.zeros_like(candidate_cpu),
                 )
-            return candidate_cpu.to(self.lokr_residual_scale.device)
+            return candidate_cpu.to(self.scalar.device)
 
         self.eval()
         try:
-            merged_weight = self._calculate_merged_weight(
+            update = self._get_effective_diff_weight(
+                self.shape,
                 base_weight,
-                multiplier=1.0,
-                shape=self.shape,
             )
-            orig_norm = (merged_weight - base_weight.to(merged_weight)).norm()
+            orig_norm = update.norm()
             if not torch.isfinite(orig_norm):
-                raise RuntimeError("Cannot normalize a non-finite LoKr residual.")
+                raise RuntimeError("Cannot normalize a non-finite LoKr update.")
             if orig_norm <= max_norm:
                 return False, orig_norm
 
             ratio = max_norm / float(orig_norm)
-            target_scale = (
-                self.lokr_residual_scale.detach().cpu().to(torch.float64) * ratio
-            )
-            candidate = stored_scale_candidate(target_scale)
-            self.lokr_residual_scale.copy_(candidate)
+            target_scalar = self.scalar.detach().cpu().to(torch.float64) * ratio
+            candidate = stored_scalar_candidate(target_scalar)
+            self.scalar.copy_(candidate)
 
             # Recompute the real stored-dtype result.  If norm rounding still
             # overshoots, each iteration makes strict progress toward zero.
             for _ in range(32):
-                merged_weight = self._calculate_merged_weight(
+                update = self._get_effective_diff_weight(
+                    self.shape,
                     base_weight,
-                    multiplier=1.0,
-                    shape=self.shape,
                 )
-                bounded_norm = (merged_weight - base_weight.to(merged_weight)).norm()
+                bounded_norm = update.norm()
                 if bounded_norm <= max_norm:
                     return True, bounded_norm
                 if not torch.isfinite(bounded_norm):
                     raise RuntimeError("Max-norm scaling produced a non-finite norm.")
 
                 correction = max_norm / float(bounded_norm)
-                current = self.lokr_residual_scale.detach().clone()
-                target_scale = current.cpu().to(torch.float64) * correction
-                candidate = stored_scale_candidate(target_scale)
+                current = self.scalar.detach().clone()
+                target_scalar = current.cpu().to(torch.float64) * correction
+                candidate = stored_scalar_candidate(target_scalar)
                 if torch.abs(candidate) >= torch.abs(current):
                     candidate_cpu = candidate.detach().cpu()
                     candidate = torch.nextafter(
                         candidate_cpu,
                         torch.zeros_like(candidate_cpu),
-                    ).to(self.lokr_residual_scale.device)
-                self.lokr_residual_scale.copy_(candidate)
+                    ).to(self.scalar.device)
+                self.scalar.copy_(candidate)
 
             # Pathological rounding must still satisfy the public postcondition.
-            self.lokr_residual_scale.zero_()
-            merged_weight = self._calculate_merged_weight(
+            self.scalar.zero_()
+            update = self._get_effective_diff_weight(
+                self.shape,
                 base_weight,
-                multiplier=1.0,
-                shape=self.shape,
             )
-            bounded_norm = (merged_weight - base_weight.to(merged_weight)).norm()
+            bounded_norm = update.norm()
             if not torch.isfinite(bounded_norm) or bounded_norm > max_norm:
                 raise RuntimeError("Unable to enforce the requested LoKr max norm.")
             return True, bounded_norm
         except Exception:
-            self.lokr_residual_scale.copy_(original_scale)
+            self.scalar.copy_(original_scalar)
             raise
         finally:
             self.train(was_training)
@@ -2204,7 +2012,6 @@ class LokrModule(LycorisBaseModule):
                         dtype=compute_dtype,
                     )
                     * self.scalar.to(h)
-                    * self.lokr_residual_scale.to(h)
                     * scale
                 )
                 return self.drop(self._weight_forward(h, diff_weight, None))
@@ -2284,9 +2091,7 @@ class LokrModule(LycorisBaseModule):
             hc = hc.transpose(-1, -2)
             h = hc.reshape(*hc.shape[:-2], -1)
 
-        return self.drop(
-            h * scale * self.scale * self.scalar.to(h) * self.lokr_residual_scale.to(h)
-        )
+        return self.drop(h * scale * self.scale * self.scalar.to(h))
 
     def bypass_forward(self, x, scale=1, *args, **kwargs):
         base = self.org_forward(x, *args, **kwargs)

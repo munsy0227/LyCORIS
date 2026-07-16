@@ -106,15 +106,20 @@ state directly into a preconstructed module, that module must also use
 optimizer parameter set.
 
 `LycorisNetwork.save_weights()` and `LycorisNetworkKohya.save_weights()` remove
-those resume-only entries and write the portable historical representation.
-Requested low save precision applies to LoKr factors, while `dora_scale` keeps
-its master dtype and `dora_zero_mask` remains boolean; these tensors are small
-and quantizing them would break the initial DoRA no-op or structural mask.
+those resume-only entries and write the portable historical representation with
+only standard LoKr factor, alpha, and optional DoRA magnitude keys. Requested
+low save precision applies to LoKr factors, while `dora_scale` keeps its master
+dtype so a low-precision save does not change the initialized DoRA magnitude.
 When saving `state_dict()` directly for inference or interchange, call
 `LokrModule.strip_training_state_keys(state_dict)` first. Conversely, do not
 strip an Accelerate/PyTorch training checkpoint that must resume exactly. With
 `load_state_dict(assign=True)`, create the optimizer after loading, as required
 by the normal PyTorch Parameter-replacement contract.
+
+For LoKr, `apply_max_norm()` limits the scalar-folded LoKr update represented by
+the portable factor tensors. With DoRA, this portable update is not the same as
+the complete nonlinear residual $W_{\mathrm{DoRA}}-W_0$, so the method does not
+promise that the norm of that complete residual is bounded by the same value.
 
 `LycorisNetwork.apply_to()` can be invoked multiple times with different wrapper
 instances. Multiple LoKr wrappers may share a target. An additive, non-DoRA

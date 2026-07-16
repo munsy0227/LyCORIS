@@ -8,8 +8,9 @@ only making existing tests pass; preserve mathematical correctness, checkpoint
 compatibility, lifecycle safety, and bounded memory use.
 
 Continue from the current branch HEAD. Commit `1109c9e` (`Harden full-matrix
-DoRA LoKr`) is the original hardening baseline; do not redo the completed audit
-unless current code contradicts this handoff.
+DoRA LoKr`) is the original hardening baseline, except for the later checkpoint
+compatibility rollback documented below. Do not redo the completed audit unless
+current code contradicts this handoff.
 
 ## Communication and execution rules
 
@@ -25,7 +26,8 @@ unless current code contradicts this handoff.
 
 ## Completed LoKR invariants
 
-The following behavior is intentional and covered by regression tests:
+The following behavior is intentional and must remain covered by regression
+tests:
 
 - When both Kronecker factors are full matrices, LoKR uses `scale = 1.0` and
   ignores alpha/rank and rs-LoRA scaling, including noncanonical external
@@ -36,9 +38,9 @@ The following behavior is intentional and covered by regression tests:
   is promoted to float32. The trainable magnitude remains an FP32 master across
   full low-precision `.to()` casts without replacing an optimizer-visible
   Parameter; explicit float64 inputs remain float64.
-- Initial exactly zero base-norm slices use a fixed checkpointed additive
-  fallback mask. This preserves the exact initial no-op while keeping a live
-  gradient; legacy/meta checkpoints derive the mask when the base materializes.
+- The standard normalized DoRA expression is used for every slice. An initially
+  exact-zero base-norm slice remains a no-op and has zero initial DoRA gradient;
+  no additive fallback state is stored in the checkpoint.
 - Linear and grouped Conv1d/2d/3d are supported. Input-axis grouped DoRA
   magnitudes are per group and local input channel.
 - Full-matrix, low-rank, Tucker, 1x1 Tucker, flattened functional Conv factors,
@@ -49,8 +51,11 @@ The following behavior is intentional and covered by regression tests:
 - `use_scalar=True` PyTorch state carries versioned raw-factor/scalar resume
   data. Portable `save_weights()` exports strip it and retain the historical
   folded representation; direct checkpoint reconstruction preserves the exact
-  scalar Parameter when resume data is present. Low-precision portable exports
-  keep DoRA magnitude/mask in their master/boolean dtypes.
+  scalar Parameter when resume data is present. Portable exports contain only
+  standard LoKr/DoRA inference keys, and low-precision exports keep the DoRA
+  magnitude in its master dtype.
+- LoKr max-norm regularization limits the portable scalar-folded LoKr update,
+  not the complete nonlinear DoRA residual relative to the base weight.
 - Kohya optimizer grouping keeps all LoKr factors in the base-LR group because
   its full, Kronecker, and Tucker forms have no validated equivalent of LoRA's
   B role. LR-zero adapters are frozen with stale gradients cleared, and the mask
@@ -92,9 +97,9 @@ The following behavior is intentional and covered by regression tests:
 
 ## Highest-priority remaining LoKR issue
 
-No unresolved correctness defect is currently known in the primary full-matrix
-LoKR DoRA path. Drive the next correctness change from concrete failing evidence
-rather than weakening the lifecycle checks added here.
+No unresolved correctness defect is currently known in the checkpoint-
+compatibility rollback. Drive the next correctness change from concrete failing
+evidence rather than reintroducing nonstandard portable tensor keys.
 
 The clearest remaining bounded-memory opportunity is checkpoint reconstruction:
 factor tensors are cloned to avoid aliasing the caller's state dict, so loading
@@ -128,10 +133,26 @@ silently alter the adapter.
 
 ## Last verified test evidence
 
-On 2026-07-15, after the final LoKr audit:
+On 2026-07-16, after the checkpoint-compatibility rollback:
 
-- 140 focused LoKR tests plus 13 Kohya optimizer/scope tests passed under
-  Python 3.12.13, PyTorch 2.13.0+cu130,
+- All 135 focused LoKR tests and 13 Kohya optimizer/scope tests passed under
+  Python 3.12.13 and PyTorch 2.13.0. Three optional Quanto/bitsandbytes tests
+  were skipped because those packages were not installed in the temporary
+  environment.
+- The focused suite verifies that native and portable saves omit the removed
+  auxiliary tensor keys, DoRA magnitude keeps its master dtype, exact-zero base
+  slices follow the standard zero-initial-gradient expression, and max-norm
+  limits the scalar-folded portable LoKr update across checkpoint round trips.
+- Relevant Ruff checks, Ruff format checks, Python compilation, and
+  `git diff --check` passed.
+- The broader `test.module` run exercised 864 parameterized cases but still
+  reported 48 BOFT bypass shape errors outside the changed LoKR paths.
+
+The 2026-07-15 evidence below predates the rollback and remains historical
+context for unaffected behavior:
+
+- The focused LoKR and Kohya optimizer/scope suites passed under Python 3.12.13,
+  PyTorch 2.13.0+cu130,
   optimum-quanto 0.2.7, and bitsandbytes 0.49.2, with no skips.
 - The Anima scope regression constructs all 28 diffusion Blocks and verifies
   the exact official 448-module set, diffusion-only application, and pattern
@@ -146,9 +167,9 @@ On 2026-07-15, after the final LoKr audit:
   now restores the reversible LoKR merge before applying a reconstructed DoRA
   checkpoint, so it compares both adapters on the same base instead of applying
   the base-dependent normalization twice.
-- CUDA edge tests passed for FP32/FP16/BF16 zero-base learning, both DoRA norm
-  axes, `use_scalar` on/off, FP32 magnitude preservation, initial bitwise no-op,
-  and optimizer Parameter identity on an NVIDIA GeForce RTX 4070.
+- The former CUDA zero-base learning result depended on the removed additive
+  fallback and is superseded. The replacement zero-initial-gradient behavior is
+  covered on CPU; matching CUDA dtype coverage remains to be rerun.
 - Twenty-four nonzero full-matrix DoRA CUDA combinations covering Linear,
   grouped Conv1d/2d/3d, both magnitude axes, and all three CUDA dtypes produced
   exact merged weights, exact undo, and bitwise-equal checkpoint reconstruction.

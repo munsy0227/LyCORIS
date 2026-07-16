@@ -161,20 +161,10 @@ cast and retains the same Parameter object when an optimizer already exists.
 
 If an initial base-norm slice is exactly zero, the normalized DoRA expression
 has no gradient path because both its initial direction and magnitude are zero.
-LyCORIS records those slices in a fixed checkpointed mask and uses the additive
-direction only on them:
-
-$$
-W_j = \begin{cases}
-V_j, & \lVert W_{0,j} \rVert = 0 \\
-V_j m_j / \operatorname{stopgrad}(\lVert V_j \rVert), & \text{otherwise.}
-\end{cases}
-$$
-
-The zero slice is still an exact no-op at initialization, but its LoKr direction
-has a live gradient. Nonzero slices retain the standard DoRA formula bit for
-bit. Legacy checkpoints derive the mask from the materialized target base; if
-the base is initially on `meta`, derivation is deferred until materialization.
+LyCORIS applies the same standard normalized expression to every slice, so an
+exact-zero slice remains an initial no-op and its initial DoRA gradient is zero.
+No additive fallback state is stored in the adapter. Portable checkpoints use
+only the standard LoKr factors, alpha, and DoRA magnitude when enabled.
 
 For grouped convolutions, input-axis magnitude is indexed by convolution group
 and local input channel. This avoids coupling unrelated groups that happen to
@@ -187,6 +177,11 @@ $$W_{\mathrm{eff}} = W_0 + \lambda(W_{\mathrm{DoRA}} - W_0)$$
 Therefore, $\lambda=0$ exactly recovers the base weight and $\lambda=1$ applies
 the full DoRA adapter. When both Kronecker factors are full matrices, LoKr uses
 unit scaling rather than alpha/rank scaling.
+
+LoKr max-norm regularization limits the scalar-folded update $\Delta W$ encoded
+by the portable factor tensors. For DoRA this is not a bound on the complete
+nonlinear residual $W_{\mathrm{DoRA}}-W_0$; the two quantities generally have
+different norms.
 
 Reversible LoKr merges retain the original target weight on CPU because DoRA
 composition is not additive. For memory-constrained inference, use a

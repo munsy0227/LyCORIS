@@ -749,30 +749,38 @@ class LokrConsistencyTests(unittest.TestCase):
         torch.testing.assert_close(base.weight, expected)
         module.onfly_restore()
 
-    def test_max_norm_bounds_actual_dora_residual_and_persists(self):
+    def test_max_norm_bounds_portable_lokr_update_and_round_trips(self):
         base = nn.Linear(8, 8)
         module = self._make_full_matrix_dora(base, use_scalar=True)
         base_weight = base.weight.detach()
-        before, _ = module.get_merged_weight(1.0, base_weight.shape)
-        before_norm = (before - base_weight).norm()
+        before_update = module._get_effective_diff_weight(
+            base_weight.shape,
+            base_weight,
+        )
+        before_norm = before_update.norm()
+        before_scalar = module.scalar.detach().clone()
         max_norm = before_norm.item() * 0.4
 
         scaled, reported_norm = module.apply_max_norm(max_norm)
+        after_update = module._get_effective_diff_weight(
+            base_weight.shape,
+            base_weight,
+        )
+        after_norm = after_update.norm()
         after, _ = module.get_merged_weight(1.0, base_weight.shape)
-        after_norm = (after - base_weight).norm()
 
         self.assertTrue(scaled)
-        torch.testing.assert_close(
-            reported_norm,
-            torch.tensor(max_norm, dtype=reported_norm.dtype),
+        self.assertLess(
+            torch.abs(module.scalar).item(),
+            torch.abs(before_scalar).item(),
         )
-        torch.testing.assert_close(
-            after_norm,
-            torch.tensor(max_norm, dtype=after_norm.dtype),
-        )
+        self.assertLessEqual(reported_norm.item(), max_norm)
+        self.assertLessEqual(after_norm.item(), max_norm)
+        torch.testing.assert_close(reported_norm, after_norm)
 
-        state_dict = module.state_dict()
-        weights = tuple(state_dict.get(name) for name in module.weight_list)
+        portable_state = copy.deepcopy(module.state_dict())
+        LokrModule.strip_training_state_keys(portable_state)
+        weights = tuple(portable_state.get(name) for name in module.weight_list)
         rebuilt_base = nn.Linear(8, 8)
         rebuilt_base.load_state_dict(base.state_dict())
         with torch.no_grad():
@@ -781,7 +789,13 @@ class LokrConsistencyTests(unittest.TestCase):
                 rebuilt_base,
                 *weights,
             )
+        rebuilt_update = rebuilt._get_effective_diff_weight(
+            rebuilt_base.weight.shape,
+            rebuilt_base.weight.detach(),
+        )
         rebuilt_weight, _ = rebuilt.get_merged_weight(1.0, base_weight.shape)
+        self.assertLessEqual(rebuilt_update.norm().item(), max_norm)
+        torch.testing.assert_close(rebuilt_update, after_update)
         torch.testing.assert_close(rebuilt_weight, after)
 
         with self.assertRaisesRegex(ValueError, "max_norm"):
@@ -791,20 +805,6 @@ class LokrConsistencyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "merged LoKr"):
             module.apply_max_norm(max_norm)
         module.merge_to(-0.1)
-
-    def test_legacy_state_without_residual_scale_still_loads(self):
-        base = nn.Linear(8, 8)
-        module = self._make_full_matrix_dora(base)
-        legacy_state = module.state_dict()
-        legacy_state.pop("lokr_residual_scale")
-
-        rebuilt = self._make_full_matrix_dora(base)
-        rebuilt.lokr_residual_scale.fill_(0.25)
-        result = rebuilt.load_state_dict(legacy_state)
-
-        self.assertEqual(result.missing_keys, [])
-        self.assertEqual(result.unexpected_keys, [])
-        self.assertEqual(rebuilt.lokr_residual_scale.item(), 1.0)
 
     def test_corrupt_checkpoint_factor_set_is_rejected(self):
         base = nn.Linear(8, 8)
@@ -1176,9 +1176,12 @@ class LokrConsistencyTests(unittest.TestCase):
                         torch.equal(state_dict["adapter.lokr_w1"], expected_w1)
                     )
 
-    def test_low_precision_portable_save_preserves_dora_master_and_mask_dtypes(self):
+    def test_low_precision_portable_save_omits_removed_keys_and_keeps_dora_master(
+        self,
+    ):
         from safetensors.torch import load_file
 
+        removed_suffixes = {"lokr_residual_scale", "dora_zero_mask"}
         for network_type in (LycorisNetwork, LycorisNetworkKohya):
             for extension in (".pt", ".safetensors"):
                 with self.subTest(
@@ -1186,8 +1189,6 @@ class LokrConsistencyTests(unittest.TestCase):
                     extension=extension,
                 ):
                     base = nn.Linear(8, 8, bias=False)
-                    with torch.no_grad():
-                        base.weight[0].zero_()
                     module = LokrModule(
                         "adapter",
                         base,
@@ -1205,6 +1206,13 @@ class LokrConsistencyTests(unittest.TestCase):
                     nn.Module.__init__(network)
                     network.add_module(module.lora_name, module)
                     network.add_module(locon.lora_name, locon)
+                    for native_state in (module.state_dict(), network.state_dict()):
+                        self.assertFalse(
+                            any(
+                                key.rsplit(".", 1)[-1] in removed_suffixes
+                                for key in native_state
+                            )
+                        )
 
                     with tempfile.TemporaryDirectory() as directory:
                         path = os.path.join(directory, f"adapter{extension}")
@@ -1219,6 +1227,12 @@ class LokrConsistencyTests(unittest.TestCase):
                             )
                         )
 
+                    self.assertFalse(
+                        any(
+                            key.rsplit(".", 1)[-1] in removed_suffixes
+                            for key in state_dict
+                        )
+                    )
                     self.assertEqual(
                         state_dict["adapter.lokr_w1"].dtype,
                         torch.bfloat16,
@@ -1226,10 +1240,6 @@ class LokrConsistencyTests(unittest.TestCase):
                     self.assertEqual(
                         state_dict["adapter.dora_scale"].dtype,
                         torch.float32,
-                    )
-                    self.assertEqual(
-                        state_dict["adapter.dora_zero_mask"].dtype,
-                        torch.bool,
                     )
                     self.assertEqual(
                         state_dict["locon.dora_scale"].dtype,
@@ -1534,9 +1544,11 @@ class LokrConsistencyTests(unittest.TestCase):
 
             self.assertTrue(rebuilt_network.loras[0].full_matrix)
             self.assertTrue(rebuilt_network.loras[0].wd)
-            self.assertIn(
-                "lycoris_0.lokr_residual_scale",
-                state_dict,
+            self.assertFalse(
+                any(
+                    key.rsplit(".", 1)[-1] in {"lokr_residual_scale", "dora_zero_mask"}
+                    for key in state_dict
+                )
             )
             torch.testing.assert_close(actual, expected)
         finally:
@@ -2284,12 +2296,13 @@ class LokrConsistencyTests(unittest.TestCase):
         self.assertTrue(module.lokr_w1.is_meta)
         state_dict = module.state_dict()
         self.assertTrue(state_dict["dora_scale"].is_meta)
-        self.assertTrue(state_dict["dora_zero_mask"].is_meta)
+        self.assertNotIn("dora_zero_mask", state_dict)
+        self.assertNotIn("lokr_residual_scale", state_dict)
         module.to_empty(device="cpu")
         self.assertFalse(module.dora_scale.is_meta)
         self.assertFalse(module.lokr_w1.is_meta)
 
-    def test_zero_base_dora_has_a_live_optimization_path(self):
+    def test_zero_base_dora_matches_standard_formula_and_has_zero_gradient(self):
         device_dtypes = [(torch.device("cpu"), torch.float32)]
         if torch.cuda.is_available():
             device_dtypes.extend(
@@ -2330,37 +2343,39 @@ class LokrConsistencyTests(unittest.TestCase):
                             wd_on_out=wd_on_out,
                             use_scalar=use_scalar,
                         ).to(device=device, dtype=dtype)
-                        self.assertTrue(torch.all(module.dora_zero_mask).item())
-                        optimizer = torch.optim.SGD(
-                            module.parameters(),
-                            lr=0.05,
+                        base_weight = base.weight.detach()
+                        rebuild = module.get_weight(base_weight.shape) * module.scalar
+                        merged, _ = module.get_merged_weight(
+                            1.0,
+                            base.weight.shape,
                         )
-                        losses = []
+                        functional = apply_dora_scale(
+                            base_weight,
+                            rebuild,
+                            module.dora_scale,
+                            1.0,
+                        )
 
-                        for step in range(8):
-                            optimizer.zero_grad(set_to_none=True)
-                            merged, _ = module.get_merged_weight(
-                                1.0,
-                                base.weight.shape,
-                            )
-                            loss = F.mse_loss(F.linear(inputs, merged), target)
-                            losses.append(loss.detach())
-                            loss.backward()
-                            if step == 0:
-                                live_parameter = (
-                                    module.scalar if use_scalar else module.lokr_w2
-                                )
-                                self.assertIsNotNone(live_parameter.grad)
-                                self.assertGreater(
-                                    live_parameter.grad.abs().sum().item(),
-                                    0.0,
-                                )
-                            optimizer.step()
-
-                        self.assertLess(losses[-1].item(), losses[0].item())
+                        torch.testing.assert_close(merged, functional)
+                        self.assertEqual(torch.count_nonzero(merged).item(), 0)
+                        loss = F.mse_loss(F.linear(inputs, merged), target)
+                        loss.backward()
+                        zero_gradient_parameter = (
+                            module.scalar if use_scalar else module.lokr_w2
+                        )
+                        self.assertIsNotNone(zero_gradient_parameter.grad)
+                        self.assertEqual(
+                            torch.count_nonzero(zero_gradient_parameter.grad).item(),
+                            0,
+                        )
+                        self.assertIsNotNone(module.dora_scale.grad)
+                        self.assertEqual(
+                            torch.count_nonzero(module.dora_scale.grad).item(),
+                            0,
+                        )
                         self.assertIsNone(base.weight.grad)
 
-    def test_partial_zero_dora_matches_functional_for_both_norm_axes(self):
+    def test_partial_zero_dora_matches_standard_formula_for_both_norm_axes(self):
         for wd_on_out in (True, False):
             with self.subTest(wd_on_out=wd_on_out):
                 base = nn.Linear(8, 8, bias=False)
@@ -2374,16 +2389,6 @@ class LokrConsistencyTests(unittest.TestCase):
                     wd_on_out=wd_on_out,
                     use_scalar=True,
                 )
-                expected_mask = torch.zeros_like(
-                    module.dora_zero_mask,
-                    dtype=torch.bool,
-                )
-                if wd_on_out:
-                    expected_mask[0] = True
-                else:
-                    expected_mask[:, 0] = True
-                self.assertTrue(torch.equal(module.dora_zero_mask, expected_mask))
-
                 base_weight = base.weight.detach()
                 rebuild = module.get_weight(base_weight.shape) * module.scalar
                 merged, _ = module.get_merged_weight(1.0, base_weight.shape)
@@ -2392,17 +2397,15 @@ class LokrConsistencyTests(unittest.TestCase):
                     rebuild,
                     module.dora_scale,
                     1.0,
-                    module.dora_zero_mask,
                 )
-                direction = base_weight.to(rebuild) + rebuild
 
                 torch.testing.assert_close(merged, functional)
                 if wd_on_out:
-                    torch.testing.assert_close(merged[0], direction[0])
+                    self.assertEqual(torch.count_nonzero(merged[0]).item(), 0)
                 else:
-                    torch.testing.assert_close(merged[:, 0], direction[:, 0])
+                    self.assertEqual(torch.count_nonzero(merged[:, 0]).item(), 0)
 
-    def test_grouped_conv_input_dora_tracks_zero_slices_per_group(self):
+    def test_grouped_conv_input_dora_handles_zero_slices_per_group(self):
         base = nn.Conv2d(4, 6, kernel_size=3, groups=2, bias=False)
         with torch.no_grad():
             grouped = base.weight.reshape(2, 3, 2, 3, 3)
@@ -2413,9 +2416,6 @@ class LokrConsistencyTests(unittest.TestCase):
             use_scalar=True,
         )
 
-        expected_mask = torch.zeros((2, 1, 2, 1, 1), dtype=torch.bool)
-        expected_mask[0, 0, 0] = True
-        self.assertTrue(torch.equal(module.dora_zero_mask.cpu(), expected_mask))
         base_weight = base.weight.detach()
         rebuild = module.get_weight(base_weight.shape) * module.scalar
         merged, _ = module.get_merged_weight(1.0, base_weight.shape)
@@ -2424,12 +2424,13 @@ class LokrConsistencyTests(unittest.TestCase):
             rebuild,
             module.dora_scale,
             1.0,
-            module.dora_zero_mask,
         )
 
         torch.testing.assert_close(merged, functional)
+        grouped_merged = merged.reshape(2, 3, 2, 3, 3)
+        self.assertEqual(torch.count_nonzero(grouped_merged[0, :, 0]).item(), 0)
 
-    def test_zero_base_dora_mask_roundtrips_and_legacy_load_derives_it(self):
+    def test_zero_base_dora_checkpoint_round_trip_without_removed_state(self):
         base = nn.Linear(8, 8, bias=False)
         with torch.no_grad():
             base.weight.zero_()
@@ -2441,6 +2442,8 @@ class LokrConsistencyTests(unittest.TestCase):
             weight_decompose=True,
         )
         state_dict = source.state_dict()
+        self.assertNotIn("dora_zero_mask", state_dict)
+        self.assertNotIn("lokr_residual_scale", state_dict)
         weights = tuple(state_dict.get(name) for name in source.weight_list)
 
         rebuilt = LokrModule.make_module_from_state_dict(
@@ -2448,87 +2451,10 @@ class LokrConsistencyTests(unittest.TestCase):
             base,
             *weights,
         )
-        self.assertTrue(torch.equal(rebuilt.dora_zero_mask, source.dora_zero_mask))
         torch.testing.assert_close(
             rebuilt.get_merged_weight(1.0, base.weight.shape)[0],
             source.get_merged_weight(1.0, base.weight.shape)[0],
         )
-
-        legacy_state = dict(state_dict)
-        legacy_state.pop("dora_zero_mask")
-        legacy_weights = tuple(legacy_state.get(name) for name in source.weight_list)
-        legacy = LokrModule.make_module_from_state_dict(
-            "legacy",
-            base,
-            *legacy_weights,
-        )
-        self.assertTrue(torch.all(legacy.dora_zero_mask).item())
-
-    def test_all_false_dora_mask_is_checkpointed_instead_of_rederived(self):
-        base = nn.Linear(8, 8, bias=False)
-        source = LokrModule(
-            "source",
-            base,
-            lora_dim=4,
-            full_matrix=True,
-            weight_decompose=True,
-            use_scalar=True,
-        )
-        self.assertFalse(torch.any(source.dora_zero_mask).item())
-
-        with torch.no_grad():
-            source.lokr_w1.normal_()
-            source.lokr_w2.normal_()
-            source.scalar.fill_(0.25)
-            base.weight[0].zero_()
-
-        state_dict = source.state_dict()
-        self.assertIn("dora_zero_mask", state_dict)
-        self.assertFalse(torch.any(state_dict["dora_zero_mask"]).item())
-        weights = tuple(state_dict.get(name) for name in source.weight_list)
-        rebuilt = LokrModule.make_module_from_state_dict(
-            "rebuilt",
-            base,
-            *weights,
-        )
-
-        self.assertFalse(torch.any(rebuilt.dora_zero_mask).item())
-        torch.testing.assert_close(
-            rebuilt.get_merged_weight(1.0, base.weight.shape)[0],
-            source.get_merged_weight(1.0, base.weight.shape)[0],
-        )
-
-        legacy_state = dict(state_dict)
-        legacy_state.pop("dora_zero_mask")
-        legacy_weights = tuple(legacy_state.get(name) for name in source.weight_list)
-        legacy = LokrModule.make_module_from_state_dict(
-            "legacy",
-            base,
-            *legacy_weights,
-        )
-        self.assertTrue(legacy.dora_zero_mask[0].item())
-
-    def test_dora_mask_must_match_the_magnitude_axis_exactly(self):
-        base = nn.Linear(8, 8, bias=False)
-        source = LokrModule(
-            "source",
-            base,
-            lora_dim=4,
-            full_matrix=True,
-            weight_decompose=True,
-            wd_on_out=True,
-        )
-        state_dict = source.state_dict()
-        weights = [state_dict.get(name) for name in source.weight_list]
-        mask_index = source.weight_list.index("dora_zero_mask")
-        weights[mask_index] = torch.zeros((1, 8), dtype=torch.bool)
-
-        with self.assertRaisesRegex(ValueError, "exactly match"):
-            LokrModule.make_module_from_state_dict(
-                "rebuilt",
-                base,
-                *weights,
-            )
 
     def test_assign_load_promotes_legacy_low_precision_dora_magnitude(self):
         base = nn.Linear(8, 8, bias=False)
@@ -2559,7 +2485,7 @@ class LokrConsistencyTests(unittest.TestCase):
             atol=0.0,
         )
 
-    def test_assign_load_materializes_legacy_mask_for_meta_created_dora(self):
+    def test_assign_load_materializes_meta_created_dora(self):
         base = nn.Linear(8, 8, bias=False)
         source = LokrModule(
             "source",
@@ -2568,8 +2494,7 @@ class LokrConsistencyTests(unittest.TestCase):
             full_matrix=True,
             weight_decompose=True,
         )
-        legacy_state = source.state_dict()
-        legacy_state.pop("dora_zero_mask", None)
+        state_dict = source.state_dict()
         with torch.device("meta"):
             target = LokrModule(
                 "target",
@@ -2579,17 +2504,15 @@ class LokrConsistencyTests(unittest.TestCase):
                 weight_decompose=True,
             )
 
-        target.load_state_dict(legacy_state, strict=True, assign=True)
+        target.load_state_dict(state_dict, strict=True, assign=True)
         merged, _ = target.get_merged_weight(1.0, base.weight.shape)
 
         self.assertFalse(any(param.is_meta for param in target.parameters()))
         self.assertFalse(any(buffer.is_meta for buffer in target.buffers()))
         self.assertEqual(target.dora_scale.dtype, torch.float32)
-        self.assertFalse(torch.any(target.dora_zero_mask).item())
-        self.assertFalse(target._dora_zero_mask_pending)
         torch.testing.assert_close(merged, base.weight.detach())
 
-    def test_pending_legacy_mask_replaces_meta_buffer_after_base_materializes(self):
+    def test_assign_loaded_dora_handles_materialized_zero_base(self):
         source_base = nn.Linear(8, 8, bias=False)
         with torch.no_grad():
             source_base.weight.zero_()
@@ -2603,8 +2526,7 @@ class LokrConsistencyTests(unittest.TestCase):
         with torch.no_grad():
             source.lokr_w1.normal_()
             source.lokr_w2.normal_()
-        legacy_state = source.state_dict()
-        legacy_state.pop("dora_zero_mask")
+        state_dict = source.state_dict()
 
         target_base = nn.Linear(8, 8, bias=False)
         target = LokrModule(
@@ -2616,22 +2538,17 @@ class LokrConsistencyTests(unittest.TestCase):
         )
         target.to(device="meta")
         target_base.to(device="meta")
-        target.load_state_dict(legacy_state, strict=True, assign=True)
+        target.load_state_dict(state_dict, strict=True, assign=True)
 
-        self.assertTrue(target.dora_zero_mask.is_meta)
-        self.assertTrue(target._dora_zero_mask_pending)
         target_base.to_empty(device="cpu")
         with torch.no_grad():
             target_base.weight.zero_()
         actual, _ = target.get_merged_weight(1.0, target_base.weight.shape)
         expected, _ = source.get_merged_weight(1.0, source_base.weight.shape)
 
-        self.assertFalse(target.dora_zero_mask.is_meta)
-        self.assertFalse(target._dora_zero_mask_pending)
-        self.assertTrue(torch.all(target.dora_zero_mask).item())
         torch.testing.assert_close(actual, expected)
 
-    def test_legacy_zero_mask_is_derived_after_meta_base_materializes(self):
+    def test_checkpoint_reconstructed_dora_handles_materialized_zero_base(self):
         base = nn.Linear(8, 8, bias=False)
         with torch.no_grad():
             base.weight.zero_()
@@ -2645,9 +2562,8 @@ class LokrConsistencyTests(unittest.TestCase):
         with torch.no_grad():
             source.lokr_w1.normal_()
             source.lokr_w2.normal_()
-        legacy_state = source.state_dict()
-        legacy_state.pop("dora_zero_mask")
-        weights = tuple(legacy_state.get(name) for name in source.weight_list)
+        state_dict = source.state_dict()
+        weights = tuple(state_dict.get(name) for name in source.weight_list)
         meta_base = nn.Linear(8, 8, bias=False, device="meta")
         rebuilt = LokrModule.make_module_from_state_dict(
             "rebuilt",
@@ -2655,18 +2571,15 @@ class LokrConsistencyTests(unittest.TestCase):
             *weights,
         )
 
-        self.assertTrue(rebuilt._dora_zero_mask_pending)
         meta_base.to_empty(device="cpu")
         with torch.no_grad():
             meta_base.weight.zero_()
         actual, _ = rebuilt.get_merged_weight(1.0, meta_base.weight.shape)
         expected, _ = source.get_merged_weight(1.0, base.weight.shape)
 
-        self.assertFalse(rebuilt._dora_zero_mask_pending)
-        self.assertTrue(torch.all(rebuilt.dora_zero_mask).item())
         torch.testing.assert_close(actual, expected)
 
-    def test_pending_zero_mask_is_resolved_before_merge_fingerprint(self):
+    def test_meta_reconstructed_zero_base_dora_merge_round_trip(self):
         base = nn.Linear(8, 8, bias=False)
         with torch.no_grad():
             base.weight.zero_()
@@ -2680,9 +2593,8 @@ class LokrConsistencyTests(unittest.TestCase):
         with torch.no_grad():
             source.lokr_w1.normal_()
             source.lokr_w2.normal_()
-        legacy_state = source.state_dict()
-        legacy_state.pop("dora_zero_mask")
-        weights = tuple(legacy_state.get(name) for name in source.weight_list)
+        state_dict = source.state_dict()
+        weights = tuple(state_dict.get(name) for name in source.weight_list)
         meta_base = nn.Linear(8, 8, bias=False, device="meta")
         rebuilt = LokrModule.make_module_from_state_dict(
             "rebuilt",
@@ -2699,33 +2611,6 @@ class LokrConsistencyTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(meta_base.weight, original))
         self.assertFalse(bool(getattr(meta_base, "_lycoris_lokr_merge_entries", {})))
-
-    def test_legacy_load_reinitializes_an_emptied_zero_mask(self):
-        base = nn.Linear(8, 8, bias=False)
-        source = LokrModule(
-            "source",
-            base,
-            lora_dim=4,
-            full_matrix=True,
-            weight_decompose=True,
-        )
-        legacy_state = source.state_dict()
-        legacy_state.pop("dora_zero_mask", None)
-        target = LokrModule(
-            "target",
-            base,
-            lora_dim=4,
-            full_matrix=True,
-            weight_decompose=True,
-        )
-        target.to_empty(device="cpu")
-        target.dora_zero_mask.fill_(True)
-
-        result = target.load_state_dict(legacy_state, strict=True)
-
-        self.assertEqual(result.missing_keys, [])
-        self.assertEqual(result.unexpected_keys, [])
-        self.assertFalse(torch.any(target.dora_zero_mask).item())
 
     def test_float64_dora_initialization_preserves_precision(self):
         base = nn.Linear(7, 5, bias=False, dtype=torch.float64)
@@ -2752,26 +2637,6 @@ class LokrConsistencyTests(unittest.TestCase):
             atol=1e-14,
         )
 
-    def test_legacy_residual_scale_load_is_scoped_per_adapter(self):
-        first = self._make_full_matrix_dora(nn.Linear(8, 8))
-        second = self._make_full_matrix_dora(nn.Linear(8, 8))
-        adapters = nn.ModuleList((first, second))
-        with torch.no_grad():
-            first.lokr_residual_scale.fill_(0.25)
-            second.lokr_residual_scale.fill_(0.5)
-        state_dict = {
-            key: value.detach().clone() for key, value in adapters.state_dict().items()
-        }
-        state_dict.pop("1.lokr_residual_scale")
-        with torch.no_grad():
-            first.lokr_residual_scale.fill_(0.9)
-            second.lokr_residual_scale.fill_(0.9)
-
-        adapters.load_state_dict(state_dict, strict=True)
-
-        self.assertEqual(first.lokr_residual_scale.item(), 0.25)
-        self.assertEqual(second.lokr_residual_scale.item(), 1.0)
-
     def test_dora_checkpoint_reconstruction_skips_base_materialization(self):
         source = self._make_full_matrix_dora(nn.Linear(8, 8))
         state_dict = source.state_dict()
@@ -2790,7 +2655,6 @@ class LokrConsistencyTests(unittest.TestCase):
     def test_checkpoint_reconstruction_materializes_helpers_in_meta_context(self):
         source = self._make_full_matrix_dora(nn.Linear(8, 8))
         state_dict = source.state_dict()
-        state_dict.pop("lokr_residual_scale")
         weights = tuple(state_dict.get(name) for name in source.weight_list)
         meta_base = nn.Linear(8, 8, device="meta")
 
@@ -2804,11 +2668,9 @@ class LokrConsistencyTests(unittest.TestCase):
         self.assertFalse(rebuilt.lokr_w1.is_meta)
         self.assertFalse(rebuilt.lokr_w2.is_meta)
         self.assertFalse(rebuilt.scalar.is_meta)
-        self.assertFalse(rebuilt.lokr_residual_scale.is_meta)
         self.assertFalse(rebuilt.dtype_tensor.is_meta)
-        self.assertEqual(rebuilt.lokr_residual_scale.item(), 1.0)
 
-    def test_assign_load_materializes_legacy_helpers_from_meta(self):
+    def test_assign_load_materializes_factors_and_helpers_from_meta(self):
         source = LokrModule(
             "source",
             nn.Linear(8, 8),
@@ -2816,7 +2678,6 @@ class LokrConsistencyTests(unittest.TestCase):
             full_matrix=True,
         )
         state_dict = source.state_dict()
-        state_dict.pop("lokr_residual_scale")
         with torch.device("meta"):
             target = LokrModule(
                 "target",
@@ -2830,7 +2691,6 @@ class LokrConsistencyTests(unittest.TestCase):
         self.assertFalse(target.lokr_w1.is_meta)
         self.assertFalse(target.lokr_w2.is_meta)
         self.assertFalse(target.scalar.is_meta)
-        self.assertFalse(target.lokr_residual_scale.is_meta)
         self.assertFalse(target.dtype_tensor.is_meta)
 
     def test_assign_load_updates_dtype_marker_from_checkpoint_factors(self):
@@ -3082,7 +2942,6 @@ class LokrConsistencyTests(unittest.TestCase):
             "lokr_w2",
             "scalar",
             "dora_scale",
-            "lokr_residual_scale",
         ):
             with self.subTest(factor=factor_name):
                 base = nn.Linear(8, 8)
@@ -3952,26 +3811,33 @@ class LokrConsistencyTests(unittest.TestCase):
                 self.assertEqual(tuple(layer.weight.shape), original_shape)
                 self.assertEqual(module.dora_scale.shape, expected_scale_shape)
 
-    def test_bfloat16_max_norm_never_rounds_above_limit(self):
+    def test_bfloat16_max_norm_update_never_rounds_above_limit(self):
         base = nn.Linear(8, 8, dtype=torch.bfloat16)
         module = self._make_full_matrix_dora(base).to(dtype=torch.bfloat16)
         self._randomize_module(module)
         limit = 0.125
 
         scaled, reported_norm = module.apply_max_norm(limit)
-        merged, _ = module.get_merged_weight(1.0, base.weight.shape)
-        actual_norm = (merged - base.weight.detach().to(merged)).norm().item()
+        update = module._get_effective_diff_weight(
+            base.weight.shape,
+            base.weight.detach(),
+        )
+        actual_norm = update.norm()
 
         self.assertTrue(scaled)
         self.assertLessEqual(reported_norm.item(), limit)
-        self.assertLessEqual(actual_norm, limit)
+        self.assertLessEqual(actual_norm.item(), limit)
+        torch.testing.assert_close(reported_norm, actual_norm)
 
     def test_max_norm_is_deterministic_in_training_and_repeated_clips(self):
         base = nn.Linear(8, 8)
         module = self._make_full_matrix_dora(base, rank_dropout=0.5)
         module.eval()
-        before, _ = module.get_merged_weight(1.0, base.weight.shape)
-        before_norm = (before - base.weight.detach().to(before)).norm().item()
+        before_update = module._get_effective_diff_weight(
+            base.weight.shape,
+            base.weight.detach(),
+        )
+        before_norm = before_update.norm().item()
         module.train()
 
         first_limit = before_norm * 0.7
@@ -3987,8 +3853,11 @@ class LokrConsistencyTests(unittest.TestCase):
         self.assertLessEqual(second_norm.item(), second_limit)
 
         module.eval()
-        merged, _ = module.get_merged_weight(1.0, base.weight.shape)
-        actual_norm = (merged - base.weight.detach().to(merged)).norm()
+        update = module._get_effective_diff_weight(
+            base.weight.shape,
+            base.weight.detach(),
+        )
+        actual_norm = update.norm()
         torch.testing.assert_close(actual_norm, second_norm)
 
     def test_bypass_accepts_mixed_factor_dtypes(self):

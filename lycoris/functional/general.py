@@ -96,7 +96,6 @@ def apply_dora_scale(
     rebuild,
     dora_scale,
     scale,
-    dora_zero_mask=None,
 ):
     compute_dtype = torch.promote_types(org_weight.dtype, rebuild.dtype)
     compute_dtype = torch.promote_types(compute_dtype, dora_scale.dtype)
@@ -114,11 +113,9 @@ def apply_dora_scale(
     if magnitude_shape == output_shape:
         norm_dims = tuple(range(1, direction.dim()))
         norm_direction = direction
-        base_norm_direction = base_weight
     elif magnitude_shape == input_shape:
         norm_dims = (0, *range(2, direction.dim()))
         norm_direction = direction
-        base_norm_direction = base_weight
     elif len(magnitude_shape) == direction.dim() + 1:
         groups = magnitude_shape[0]
         if (
@@ -137,7 +134,6 @@ def apply_dora_scale(
             direction.shape[1],
             *direction.shape[2:],
         )
-        base_norm_direction = base_weight.reshape_as(norm_direction)
         norm_dims = (1, *range(3, norm_direction.dim()))
     else:
         raise ValueError(
@@ -156,26 +152,5 @@ def apply_dora_scale(
     normalized_direction = norm_direction * (
         dora_scale.to(device=direction.device, dtype=direction.dtype) / direction_norm
     )
-    if dora_zero_mask is None:
-        base_norm = torch.linalg.vector_norm(
-            base_norm_direction,
-            dim=norm_dims,
-            keepdim=True,
-        )
-        dora_zero_mask = base_norm == 0
-    else:
-        if not isinstance(dora_zero_mask, torch.Tensor):
-            raise TypeError("dora_zero_mask must be a Tensor.")
-        if tuple(dora_zero_mask.shape) != magnitude_shape:
-            raise ValueError(
-                "dora_zero_mask must match dora_scale: "
-                f"mask={tuple(dora_zero_mask.shape)}, dora_scale={magnitude_shape}."
-            )
-    zero_mask = dora_zero_mask.to(device=direction.device, dtype=torch.bool)
-    dora_weight = torch.where(
-        zero_mask,
-        norm_direction,
-        normalized_direction,
-    )
-    dora_weight = dora_weight.reshape_as(direction)
+    dora_weight = normalized_direction.reshape_as(direction)
     return base_weight + (dora_weight - base_weight) * scale

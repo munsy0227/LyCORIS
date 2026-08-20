@@ -13,6 +13,7 @@ from .base import (
     LycorisBaseModule,
     _ensure_target_unwrapped_for_merge,
     _is_additive_lokr_stack_adapter,
+    is_weight_only_fp8_linear,
 )
 from ..functional import factorization, rebuild_tucker
 from ..functional.lokr import make_kron
@@ -240,9 +241,9 @@ class LokrModule(LycorisBaseModule):
         self.wd = weight_decompose
         self.wd_on_out = wd_on_out
         if self.wd:
-            if self.bypass_mode:
+            if self.bypass_mode and not is_weight_only_fp8_linear(org_module):
                 logging_disable_bypass_for_dora()
-            self.bypass_mode = False
+                self.bypass_mode = False
 
             self.dora_norm_dims = len(self.shape) - 1
             org_weight = self._current_weight()
@@ -1560,6 +1561,10 @@ class LokrModule(LycorisBaseModule):
             raise ValueError(f"Merge multiplier must be finite, got {multiplier}.")
         if multiplier == 0:
             return
+        if is_weight_only_fp8_linear(self.org_module[0]):
+            raise RuntimeError(
+                "Merging LyCORIS modules into weight-only FP8 Linear is not supported."
+            )
         if self.is_quant:
             raise NotImplementedError(
                 "Merging LoKr into a quantized base weight requires explicit "
@@ -1722,6 +1727,10 @@ class LokrModule(LycorisBaseModule):
         if not math.isfinite(multiplier):
             raise ValueError(
                 f"On-the-fly merge multiplier must be finite, got {multiplier}."
+            )
+        if multiplier != 0 and is_weight_only_fp8_linear(self.org_module[0]):
+            raise RuntimeError(
+                "Merging LyCORIS modules into weight-only FP8 Linear is not supported."
             )
         if multiplier != 0 and self.is_quant:
             raise NotImplementedError(
@@ -2121,7 +2130,10 @@ class LokrModule(LycorisBaseModule):
                 if torch.rand(1) < self.module_dropout:
                     return self.org_forward(x, *args, **kwargs)
 
-            if self.bypass_mode:
+            fp8_weight_decompose = self.wd and is_weight_only_fp8_linear(
+                self.org_module[0]
+            )
+            if self.bypass_mode and not fp8_weight_decompose:
                 if context_token is None:
                     base = self.org_forward(x, *args, **kwargs)
                     base_weight = current_forward_weight().to(x.device)

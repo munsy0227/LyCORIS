@@ -21,6 +21,7 @@ from .modules.diag_oft import DiagOFTModule
 from .modules.boft import ButterflyOFTModule
 from .modules.tlora import TLoraModule
 from .modules import get_module, make_module
+from .modules.base import is_supported_linear_module, is_weight_only_fp8_linear
 
 from .config import PRESET
 from .config_sdk import VALID_PRESET_KEYS
@@ -387,7 +388,14 @@ class LycorisNetwork(torch.nn.Module):
             if dim is not None and dim == 0:
                 return None
             lora = None
-            if isinstance(module, torch.nn.Linear) and lora_dim > 0:
+            if (
+                is_supported_linear_module(
+                    module,
+                    algo_name,
+                    weight_decompose=kwargs.get("weight_decompose", False),
+                )
+                and lora_dim > 0
+            ):
                 dim = dim or lora_dim
                 alpha = alpha or self.alpha
             elif isinstance(
@@ -413,7 +421,7 @@ class LycorisNetwork(torch.nn.Module):
                 adapter_dropout,
                 adapter_rank_dropout,
                 adapter_module_dropout,
-                use_tucker,
+                use_tucker=use_tucker,
                 **kwargs,
             )
             return lora
@@ -660,7 +668,15 @@ class LycorisNetwork(torch.nn.Module):
             logger.info(f"weights are loaded: {info}")
 
     def is_mergeable(self):
-        return True
+        return not any(
+            is_weight_only_fp8_linear(lora.org_module[0]) for lora in self.loras
+        )
+
+    def _ensure_mergeable(self):
+        if not self.is_mergeable():
+            raise RuntimeError(
+                "Merging LyCORIS modules into weight-only FP8 Linear is not supported."
+            )
 
     def restore(self):
         for lora in self.loras:
@@ -673,6 +689,7 @@ class LycorisNetwork(torch.nn.Module):
         precise: bool = False,
         reversible: bool = True,
     ):
+        self._ensure_mergeable()
         merge_weight = float(weight)
         if not math.isfinite(merge_weight):
             raise ValueError(f"Merge weight must be finite, got {merge_weight}.")
@@ -802,6 +819,7 @@ class LycorisNetwork(torch.nn.Module):
             lora.finalize_merge()
 
     def onfly_merge(self, weight=1.0):
+        self._ensure_mergeable()
         merge_weight = float(weight)
         if not math.isfinite(merge_weight):
             raise ValueError(

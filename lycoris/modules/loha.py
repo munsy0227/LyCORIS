@@ -65,7 +65,7 @@ class LohaModule(LycorisBaseModule):
 
         w_shape = self.shape
         if self.module_type.startswith("conv"):
-            in_dim = org_module.in_channels
+            in_dim = org_module.in_channels // org_module.groups
             k_size = org_module.kernel_size
             out_dim = org_module.out_channels
             self.shape = (out_dim, in_dim, *k_size)
@@ -125,7 +125,7 @@ class LohaModule(LycorisBaseModule):
         if self.dropout:
             print("[WARN]LoHa/LoKr haven't implemented normal dropout yet.")
 
-        if type(alpha) == torch.Tensor:
+        if type(alpha) is torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
         alpha = lora_dim if alpha is None or alpha == 0 else alpha
 
@@ -292,7 +292,8 @@ class LohaModule(LycorisBaseModule):
         return scaled, orig_norm * ratio
 
     def bypass_forward_diff(self, x, scale=1):
-        diff_weight = self.get_weight(self.shape) * self.scalar * scale
+        scalar = self.scalar.to(device=x.device, dtype=x.dtype)
+        diff_weight = self.get_weight(self.shape).to(x) * scalar * scale
         return self.drop(self.op(x, diff_weight, **self.kw_dict))
 
     def bypass_forward(self, x, scale=1):

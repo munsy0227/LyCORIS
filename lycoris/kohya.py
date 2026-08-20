@@ -20,6 +20,7 @@ from .modules.glora import GLoRAModule
 from .modules.lokr import LokrModule
 from .modules.norms import NormModule
 from .modules import make_module, get_module
+from .modules.base import is_supported_linear_module
 
 from .config import PRESET
 from .utils.preset import read_preset
@@ -374,7 +375,12 @@ class LycorisNetworkKohya(LycorisNetwork):
         "JointTransformerBlock",  # lumina-image-2
         "FinalLayer",  # lumina-image-2, Anima
         "QwenImageTransformerBlock",  # Qwen
+        "LensTransformerBlock",  # Lens
+        "Ideogram4TransformerBlock",  # Ideogram 4
         "ZImageTransformerBlock",
+        "AceStepEncoderLayer",
+        "AceStepDiTLayer",
+        "TextFusionBlock",  # Krea 2
         "Block",  # Anima
         "PatchEmbed",  # Anima
         "TimestepEmbedding",  # Anima
@@ -564,7 +570,14 @@ class LycorisNetworkKohya(LycorisNetwork):
                 return None
 
             lora = None
-            if isinstance(module, torch.nn.Linear) and lora_dim > 0:
+            if (
+                is_supported_linear_module(
+                    module,
+                    algo_name,
+                    weight_decompose=kwargs.get("weight_decompose", False),
+                )
+                and lora_dim > 0
+            ):
                 dim = dim or lora_dim
                 alpha = alpha or self.alpha
             elif isinstance(
@@ -590,7 +603,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                 adapter_dropout,
                 adapter_rank_dropout,
                 adapter_module_dropout,
-                use_tucker,
+                use_tucker=use_tucker,
                 **kwargs,
             )
             if lora is not None:

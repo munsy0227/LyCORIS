@@ -66,8 +66,12 @@ NUMEXPR_NUM_THREADS=1 PYTHONPATH=.`를 지정했다.
 
 ## 미검증과 다음 작업
 
-- NVIDIA 드라이버가 응답하지 않아 실제 CUDA/Triton/TileLang 경로는 미검증이다.
-  MPS/Windows와 실제 Anima 학습, Kohya/SDXL 및 Flux 전체 모델 integration도 미검증이다.
+- 이 동기화 단계에서는 기본 샌드박스의 NVIDIA 장치 접근 제한 때문에
+  CUDA/Triton/TileLang 경로를 검증하지 못했다. 드라이버 자체 오류라는 초기
+  판단은 후속 GPU 검사에서 정정했다. 추가 결과는
+  `2026-10-08-gpu-validation.md`에 기록한다.
+- MPS/Windows와 실제 Anima 학습, Kohya/SDXL 및 Flux 전체 모델 integration은
+  이 동기화 단계에서 검증하지 않았다.
 - 이후 GPU 환경에서 새 커널의 수치/gradient와 실제 사용자 학습 설정을 검증한다.
 - 필요하면 기존 LoRA/LoHa wrapper 실패를 별도 작업으로 진단한다.
 - 원격 반영은 별도 사용자 요청에 따라 수행한다. 검증용 임시 환경과 패키지,

@@ -130,8 +130,45 @@ silently alter the adapter.
 - `test/test_lokr.py`: standard unittest discovery entry point.
 - `test/test_kohya_optimizer.py`: Kohya optimizer grouping, freezing, and
   `apply_to()` lifecycle regressions.
+- `test/test_lokr_cuda.py`: CUDA full-matrix DoRA reference math/gradients,
+  checkpoint/exact undo, zero-base initialization, and tiny mock Anima smoke.
 
 ## Last verified test evidence
+
+On 2026-10-08, the synchronized tree was tested on an RTX 4070 under Linux.
+See `.ai/worklogs/2026-10-08-gpu-validation.md` for the environment, discovered
+kernel defects, fixes, and commands. The user's Windows use is out of scope.
+
+- CUDA access requires execution outside the default sandbox's device mask.
+  The earlier `nvidia-smi` failure was a sandbox access limitation, not a
+  demonstrated driver malfunction.
+- PyTorch 2.14.1+cu130 / Triton 3.8.0 / TileLang 0.1.15 were used. TileLang
+  was tested with `TILELANG_EXECUTION_BACKEND=nvrtc`; its other execution
+  backends were not verified.
+- The final Triton selection ran 624 tests: 621 passed, three optional
+  quantization tests skipped. It includes 54 kernel tests, the 567-test LoKR
+  selection, and three dedicated CUDA tests. TileLang's 53 kernel tests,
+  567-test LoKR selection (three optional skips), and three CUDA tests passed.
+- Dedicated CUDA tests compare full-matrix DoRA against an independent
+  Kronecker/normalization expression in 24 nonzero combinations: Linear,
+  grouped Conv1d/2d/3d, both norm axes, FP32/FP16/BF16. They check gradients,
+  runtime multipliers, native checkpoint reconstruction, and exact merge undo.
+  Initial zero-base no-op and zero gradients also passed in all three dtypes.
+- A tiny mock Anima applies all 448 diffusion adapters in BF16 with
+  `network_dim=100000`, factor=4, DoRA, scalar, and regex dimensions. One
+  selected AdaLN projection retains the exact initial no-op, gets a finite
+  nonzero scalar gradient, and changes output after one SGD step.
+- The three GPU-driven fixes are distinct: Triton LoRA branch-local variable
+  names avoid incompatible SSA shapes; TileLang OFT tensor argument names
+  avoid NVRTC wrapper locals; GradPack pads view starts to 256-byte FP32
+  boundaries to prevent misaligned vector stores for small LoKR factors.
+  Packing still uses one scratch allocation and one homogeneous cast, with
+  at most 252 padding bytes between gradients.
+- Seventeen Kohya optimizer/scope and compile-compatibility CPU tests passed.
+  With automatic tuning enabled, five LoKR tests passed on each fused backend;
+  ten tuning winners per backend were persisted in the temporary cache.
+  Real Anima training, performance/long-duration behavior, MPS, optional
+  quantization runtimes, and full Kohya/Flux integrations remain unverified.
 
 On 2026-10-08, upstream main `4a6a333` was merged into the fork. See
 `.ai/worklogs/2026-10-08-upstream-sync.md` for the conflict decisions and

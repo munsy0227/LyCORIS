@@ -171,6 +171,31 @@ class AutogradParity(unittest.TestCase):
         )
         self._cmp(ours, eager, ours_l, eag_l, mk(a * c, b * d), dtype, "lokr")
 
+    @parameterized.expand(
+        list(product(BACKENDS, [torch.float16, torch.bfloat16, torch.float32])),
+        skip_on_empty=True,
+    )
+    def test_lokr_small_full_rebuild(self, backend, dtype):
+        # A 2x2 first factor plus an unused 1x2 half used to misalign the
+        # second factor's packed gradient and crash TileLang vector stores.
+        mk = lambda *s: torch.randn(*s, device="cuda", dtype=dtype) * 0.1
+        w1, w2 = mk(2, 2), mk(4, 4)
+        ours_l = [v.clone().requires_grad_(True) for v in (w1, w2)]
+        eager_l = [v.clone().requires_grad_(True) for v in (w1, w2)]
+        ours = lokr_diff_weight(
+            ours_l[0], None, None, ours_l[1], None, None, gamma=1.0, backend=backend
+        )
+        eager = torch.kron(*eager_l)
+        tol = 2e-2 if dtype != torch.float32 else 1e-4
+        torch.testing.assert_close(ours, eager, rtol=tol, atol=tol * 0.01)
+        grad = mk(8, 8)
+        for got, expected in zip(
+            _grads(ours, ours_l, grad), _grads(eager, eager_l, grad)
+        ):
+            self.assertTrue(torch.isfinite(got).all())
+            self.assertGreater(got.abs().sum().item(), 0)
+            torch.testing.assert_close(got, expected, rtol=tol, atol=tol * 0.01)
+
     @parameterized.expand(CASES, skip_on_empty=True)
     def test_lokr_bypass(self, backend, dtype):
         t, a, b, c, d = 64, 16, 20, 12, 14

@@ -165,7 +165,7 @@ def _oft_fwd(
     @T.prim_func
     def main(
         blocks: T.Tensor((K, S, S), dtype),
-        res: T.Tensor((K * S,), dtype),
+        rescale: T.Tensor((K * S,), dtype),
         x: T.Tensor((NB * L * K * S,), dtype),
         out: T.Tensor((NB * L * K * S,), dtype),
         cscale: T.float32,
@@ -205,7 +205,7 @@ def _oft_fwd(
                     piv = a_s[jj, jj]
                     a_s[jj, j] = a_s[jj, j] / piv
                     m_s[jj, j] = m_s[jj, j] / piv
-            # rf[i, j] = res[i] * R[j, i] - shift*I; R = (I+q) @ M
+            # rf[i, j] = rescale[i] * R[j, i] - shift*I; R = (I+q) @ M
             for i, j in T.Parallel(ps, ps):
                 acc = T.alloc_var("float32")
                 acc = T.cast(0, "float32")
@@ -219,7 +219,7 @@ def _oft_fwd(
                     acc += lhs * m_s[kk, i]
                 scale = T.if_then_else(
                     rescale_on and (i < S),
-                    T.cast(res[bk * S + i], "float32"),
+                    T.cast(rescale[bk * S + i], "float32"),
                     T.cast(1, "float32"),
                 )
                 sh = T.if_then_else(
@@ -262,7 +262,7 @@ def _oft_bwd(
     @T.prim_func
     def main(
         blocks: T.Tensor((K, S, S), dtype),
-        res: T.Tensor((K * S,), dtype),
+        rescale: T.Tensor((K * S,), dtype),
         x: T.Tensor((NB * L * K * S,), dtype),
         g: T.Tensor((NB * L * K * S,), dtype),
         gx: T.Tensor((NB * L * K * S,), dtype),
@@ -325,7 +325,7 @@ def _oft_bwd(
             for i, j in T.Parallel(ps, ps):
                 scale = T.if_then_else(
                     rescale_on and (i < S),
-                    T.cast(res[bk * S + i], "float32"),
+                    T.cast(rescale[bk * S + i], "float32"),
                     T.cast(1, "float32"),
                 )
                 sh = T.if_then_else(
@@ -371,11 +371,11 @@ def _oft_bwd(
                     for j in T.serial(ps):
                         acc += grf_s[i, j] * r_s[j, i]
                     T.atomic_add(gres[bk * S + i], acc)
-            # gR[j,i] = res[i]*gRf[i,j]; gQ = (I+R)^T gR M^T; gB = (gQ-gQ^T)*cscale
+            # gR[j,i] = rescale[i]*gRf[i,j]; gQ = (I+R)^T gR M^T
             for i, j in T.Parallel(ps, ps):
                 scale = T.if_then_else(
                     rescale_on and (j < S),
-                    T.cast(res[bk * S + j], "float32"),
+                    T.cast(rescale[bk * S + j], "float32"),
                     T.cast(1, "float32"),
                 )
                 tmp_s[i, j] = scale * grf_s[j, i]

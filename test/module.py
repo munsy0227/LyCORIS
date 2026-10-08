@@ -19,7 +19,6 @@ from lycoris.modules import (
     IA3Module,
 )
 
-
 modules: list[LycorisBaseModule] = [
     LoConModule,
     LohaModule,

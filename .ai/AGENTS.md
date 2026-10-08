@@ -133,6 +133,27 @@ silently alter the adapter.
 
 ## Last verified test evidence
 
+On 2026-10-08, upstream main `4a6a333` was merged into the fork. See
+`.ai/worklogs/2026-10-08-upstream-sync.md` for the conflict decisions and
+verification commands. The pre-sync state is retained on
+`codex/pre-upstream-sync-20261008` (`fc54285`).
+
+- The 180-test focused/kernel/compile/precision selection passed on CPU, with
+  29 skips (26 CUDA/backend cases and three optional quantization cases) and
+  one expected precision-drift failure. All 890 module/functional cases passed.
+- All three preset exclusion tests passed; 59 package modules imported cleanly,
+  with 42 optional backend modules skipped. CPU smoke, package build, installed
+  wheel DoRA backward/exact merge undo, Ruff, Black API formatting checks, Python
+  compilation, and diff whitespace checks passed.
+- The same 10 non-LoKR wrapper failure IDs were reproduced before and after
+  synchronization. They remain separate from this sync. CUDA, MPS, Windows,
+  real Anima, and the full Kohya/Flux integrations were not tested in this run.
+- LoKr now uses upstream kernel dispatch for compatible rebuild and linear
+  bypass paths, while retaining the fork's DoRA, scalar/checkpoint, grouped
+  convolution, and merge lifecycle invariants. LoKr DoRA deliberately keeps its
+  detached-norm residual implementation instead of the upstream shared fused
+  DoRA epilogue. Float64 operands fall back from the fused kernel tiers.
+
 On 2026-07-16, after the checkpoint-compatibility rollback:
 
 - All 135 focused LoKR tests and 13 Kohya optimizer/scope tests passed under

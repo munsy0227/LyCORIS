@@ -1,3 +1,8 @@
+.internal/
+out/
+coverage_report/
+.ruff_cache/
+
 # Triton objects on Windows
 *.exp
 *.lib
@@ -19,8 +24,8 @@ exps/
 *.pt
 *.ckpt
 test*.py
-!test/test_lokr.py
-!test/test_kohya_optimizer.py
+!test/*.py
+!test/**/*.py
 
 # Editors
 .vscode/

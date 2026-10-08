@@ -79,6 +79,11 @@ class MergePrecisionTests(unittest.TestCase):
                 for param in wrapper.parameters():
                     torch.nn.init.normal_(param)
 
+        # The fork rejects destructive merges while a forward wrapper is
+        # active. Keep the trained factors, then remove the forward stack.
+        for wrapper in reversed(wrappers):
+            wrapper.restore()
+
         original_weight = base.weight.detach().clone()
 
         for _ in range(cycles):

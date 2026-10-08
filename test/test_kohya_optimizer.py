@@ -219,9 +219,7 @@ class AnimaOfficialScopeTests(unittest.TestCase):
         network, _, _ = self._create_network(
             block_count=1,
             network_reg_dims=(
-                r".*self\_attn.*=100000,"
-                r".*cross\_attn.*=100000,"
-                r".*mlp.*=100000"
+                r".*self\_attn.*=100000," r".*cross\_attn.*=100000," r".*mlp.*=100000"
             ),
         )
 

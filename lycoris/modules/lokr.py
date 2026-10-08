@@ -15,10 +15,9 @@ from .base import (
     _is_additive_lokr_stack_adapter,
     is_weight_only_fp8_linear,
 )
-from ..functional import factorization, rebuild_tucker
-from ..functional.lokr import make_kron
+from ..functional import factorization
+from ..functional.lokr import kron_bypass, kron_weight
 from ..logging import logger
-
 
 _lokr_forward_weights = ContextVar("lokr_forward_weights", default=None)
 _MERGE_FINGERPRINT_CHUNK_BYTES = 1024 * 1024
@@ -1069,28 +1068,19 @@ class LokrModule(LycorisBaseModule):
 
         device_type = torch.device(device).type
         with torch.autocast(device_type=device_type, enabled=False):
-            if self.use_w1:
-                w1 = self._factor_for_compute(self.lokr_w1, device, dtype)
-            else:
-                w1a = self._factor_for_compute(self.lokr_w1_a, device, dtype)
-                w1b = self._factor_for_compute(self.lokr_w1_b, device, dtype)
-                w1 = w1a @ w1b
 
-            if self.use_w2:
-                w2 = self._factor_for_compute(self.lokr_w2, device, dtype)
-            else:
-                w2a = self._factor_for_compute(self.lokr_w2_a, device, dtype)
-                w2b = self._factor_for_compute(self.lokr_w2_b, device, dtype)
-                if self.tucker:
-                    t2 = self._factor_for_compute(self.lokr_t2, device, dtype)
-                    w2 = rebuild_tucker(t2, w2a, w2b)
-                else:
-                    w2 = w2a @ w2b
+            def factor(name):
+                return self._factor_for_compute(getattr(self, name), device, dtype)
 
-            weight = make_kron(
-                w1,
-                w2,
-                self.scale,
+            weight = kron_weight(
+                factor("lokr_w1") if self.use_w1 else None,
+                None if self.use_w1 else factor("lokr_w1_a"),
+                None if self.use_w1 else factor("lokr_w1_b"),
+                factor("lokr_w2") if self.use_w2 else None,
+                None if self.use_w2 else factor("lokr_w2_a"),
+                None if self.use_w2 else factor("lokr_w2_b"),
+                factor("lokr_t2") if self.tucker and not self.use_w2 else None,
+                scale=self.scale,
             )
         if shape is not None:
             weight = weight.view(shape)
@@ -2024,6 +2014,19 @@ class LokrModule(LycorisBaseModule):
                     * scale
                 )
                 return self.drop(self._weight_forward(h, diff_weight, None))
+
+        if not is_conv:
+            diff = kron_bypass(
+                h,
+                self.lokr_w1.to(h) if self.use_w1 else None,
+                None if self.use_w1 else self.lokr_w1_a.to(h),
+                None if self.use_w1 else self.lokr_w1_b.to(h),
+                self.lokr_w2.to(h) if self.use_w2 else None,
+                None if self.use_w2 else self.lokr_w2_a.to(h),
+                None if self.use_w2 else self.lokr_w2_b.to(h),
+                scale=self.scale * scale,
+            )
+            return self.drop(diff * self.scalar.to(h))
 
         if self.use_w2:
             ba = self.lokr_w2.to(h)

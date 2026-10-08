@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from .base import LycorisBaseModule
+from ..functional.general import add_scaled
 from ..logging import logger
 
 
@@ -291,7 +292,7 @@ class FullModule(LycorisBaseModule):
             weight_drop = (
                 drop.view(-1, *[1] * (diff_w.dim() - 1)) if drop is not None else 1
             )
-            weight = self.org_weight.to(diff_w) + diff_w * weight_drop
+            weight = add_scaled(self.org_weight.to(diff_w), diff_w, weight_drop)
             if self.is_diff and hasattr(self.org_module[0], "bias"):
                 base_bias = self.org_module[0].bias
             else:
@@ -312,7 +313,12 @@ class FullModule(LycorisBaseModule):
             diff_b = None
             if self.bias is not None:
                 diff_b = self.bias * multiplier
-            return self.weight * multiplier, diff_b
+            diff = self.weight.to(device) * multiplier
+            if shape is not None:
+                diff = diff.view(shape)
+            if diff_b is not None:
+                diff_b = diff_b.to(device)
+            return diff, diff_b
         org_weight = self.org_weight.to(device, dtype=self.weight.dtype)
         diff = self.weight.to(device) - org_weight
         diff_b = None

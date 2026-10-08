@@ -8,6 +8,10 @@ from test.functional import LycorisFunctionalTests
 from test.lokr import LokrConsistencyTests
 from test.module import LycorisModuleTests
 from test.wrapper import LycorisWrapperTests
+from test.precision_merge_test import MergePrecisionTests
+from test.kernels.test_ops import OpsVsFp64
+from test.kernels.test_autograd import AutogradParity, SafeFallback
+from test.torch_compile import TorchCompileCompatibility
 
 if os.environ.get("LYCORIS_RUN_KOHYA_INTEGRATION") == "1":
     # Importing this module loads a full SDXL checkpoint, so keep it opt-in.
@@ -25,6 +29,11 @@ TESTS = [
     LycorisFunctionalTests,
     LycorisWrapperTests,
     LokrConsistencyTests,
+    MergePrecisionTests,
+    OpsVsFp64,
+    AutogradParity,
+    SafeFallback,
+    TorchCompileCompatibility,
 ]
 
 if os.environ.get("LYCORIS_RUN_KOHYA_INTEGRATION") == "1":

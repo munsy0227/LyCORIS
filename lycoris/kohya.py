@@ -27,7 +27,6 @@ from .utils.preset import read_preset
 from .utils import str_bool
 from .logging import logger
 
-
 # The official Anima LoRA covers every Linear in each diffusion Block,
 # including the six AdaLN modulation projections.  Norm, embedder, and final
 # layers remain outside that diffusion-block adapter scope.
@@ -412,6 +411,7 @@ class LycorisNetworkKohya(LycorisNetwork):
     MODULE_ALGO_MAP = {}
     NAME_ALGO_MAP = {}
     USE_FNMATCH = False
+    TARGET_EXCLUDE_NAME = []
 
     @classmethod
     def apply_preset(cls, preset):
@@ -433,6 +433,8 @@ class LycorisNetworkKohya(LycorisNetwork):
             cls.NAME_ALGO_MAP = preset["name_algo_map"]
         if "use_fnmatch" in preset:
             cls.USE_FNMATCH = preset["use_fnmatch"]
+        if "exclude_name" in preset:
+            cls.TARGET_EXCLUDE_NAME = preset["exclude_name"]
         return cls
 
     def __init__(
@@ -625,6 +627,9 @@ class LycorisNetworkKohya(LycorisNetwork):
                 else:
                     full_original_name = original_prefix or name
 
+                if self.is_excluded(full_original_name):
+                    continue
+
                 is_excluded = matches_any_pattern(
                     self.exclude_re_patterns, full_original_name
                 )
@@ -684,6 +689,8 @@ class LycorisNetworkKohya(LycorisNetwork):
             matched_modules = set()
             matched_names = set()
             for name, module in root_module.named_modules():
+                if self.is_excluded(name):
+                    continue
                 module_name = module.__class__.__name__
                 if module_name in target_replace_modules and not any(
                     self.match_fn(t, name) for t in target_replace_names
@@ -851,15 +858,23 @@ class LycorisNetworkKohya(LycorisNetwork):
         # assertion
         names = set()
         for lora in self.loras:
-            assert lora.lora_name not in names, (
-                f"duplicated lora name: {lora.lora_name}"
-            )
+            assert (
+                lora.lora_name not in names
+            ), f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
 
     def match_fn(self, pattern: str, name: str) -> bool:
         if self.USE_FNMATCH:
             return fnmatch.fnmatch(name, pattern)
         return re.match(pattern, name)
+
+    def is_excluded(self, name: str) -> bool:
+        """A module path the preset's `exclude_name` rules keep out of scope."""
+        if not name or not self.TARGET_EXCLUDE_NAME:
+            return False
+        return name in self.TARGET_EXCLUDE_NAME or any(
+            self.match_fn(t, name) for t in self.TARGET_EXCLUDE_NAME
+        )
 
     def find_conf_for_name(
         self,
@@ -890,9 +905,9 @@ class LycorisNetworkKohya(LycorisNetwork):
         return state
 
     def apply_to(self, text_encoder, unet, apply_text_encoder=None, apply_unet=None):
-        assert apply_text_encoder is not None and apply_unet is not None, (
-            "internal error: flag not set"
-        )
+        assert (
+            apply_text_encoder is not None and apply_unet is not None
+        ), "internal error: flag not set"
 
         selection = (bool(apply_text_encoder), bool(apply_unet))
         previous_selection = getattr(self, "_applied_selection", None)

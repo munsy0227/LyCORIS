@@ -2,5 +2,4 @@
 
 from test.lokr import LokrConsistencyTests
 
-
 __all__ = ["LokrConsistencyTests"]

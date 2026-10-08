@@ -24,5 +24,3 @@ imagesize==1.4.1
 numpy
 rich==14.1.0
 sentencepiece==0.2.1
-# sd-scripts' setup.py does not install its training requirements automatically.
-git+https://github.com/kohya-ss/sd-scripts@690ea7f96c23182352ec63def76d431c6120bd2f

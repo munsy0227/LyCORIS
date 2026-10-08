@@ -98,6 +98,20 @@ A detailed description of the network arguments is provided in [docs/usage/netwo
 
 #### kohya script
 
+When using an existing sd-scripts checkout, install that checkout's training
+requirements first, then install your local LyCORIS checkout in the same virtual
+environment. Install a matching PyTorch/torchvision pair for your device first.
+
+```bash
+cd /path/to/sd-scripts
+python -m pip install -r requirements.txt
+python -m pip install /path/to/LyCORIS
+```
+
+This uses the sd-scripts revision you selected, including any local fixes.
+`requirements-kohya.txt` lists training dependencies for the upstream revision
+noted in its header; it does not install or replace an sd-scripts checkout.
+
 You can use this package's kohya module to run kohya's training script to train lycoris module for SD models
 
 - with command line arguments

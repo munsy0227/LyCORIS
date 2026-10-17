@@ -162,7 +162,13 @@ optimizer = torch.optim.AdamW(network.parameters(), lr=1e-4)
 The `unet` slot holds the MOSS Transformer. Both MOSS presets create zero Qwen
 text-encoder adapters even if a text encoder is supplied. This API uses the
 existing `lora_unet_...` prefix; use `create_network_from_weights` for its exports.
-It does not make the sd-scripts command-line trainers support MOSS automatically.
+The local sd-scripts fork adds `moss_train_network.py` for this factory, including
+unchanged Anima-style TXT sidecars, MOSS caption JSON and layout JSON. Its
+`docs/moss_train_network.md` contains commands and a native ComfyUI workflow.
+The matching local ComfyUI patch accepts both `lora_unet_` and generic `lycoris_`
+names, including separate Q/K/V adapters on fused QKV weights, and corrects the
+shared output-axis DoRA direction norm. These integrations are separate from
+LyCORIS installation; install the local forks to use them.
 
 ## Validation
 

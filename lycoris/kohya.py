@@ -23,7 +23,7 @@ from .modules import make_module, get_module
 from .modules.base import is_supported_linear_module
 
 from .config import PRESET
-from .utils.preset import read_preset
+from .utils.preset import configure_preset, read_preset
 from .utils import str_bool
 from .logging import logger
 
@@ -166,7 +166,6 @@ def create_network(
     else:
         preset = PRESET[preset_str]
     assert preset is not None
-    LycorisNetworkKohya.apply_preset(preset)
 
     logger.info(f"Using rank adaptation algo: {algo}")
 
@@ -216,6 +215,7 @@ def create_network(
     network = LycorisNetworkKohya(
         text_encoder,
         unet,
+        _preset=preset,
         multiplier=multiplier,
         lora_dim=network_dim,
         conv_lora_dim=conv_dim,
@@ -355,6 +355,17 @@ class LycorisNetworkKohya(LycorisNetwork):
     LoRA + LoCon
     """
 
+    _PRESET_FIELDS = {
+        "enable_conv": "ENABLE_CONV",
+        "unet_target_module": "UNET_TARGET_REPLACE_MODULE",
+        "unet_target_name": "UNET_TARGET_REPLACE_NAME",
+        "text_encoder_target_module": "TEXT_ENCODER_TARGET_REPLACE_MODULE",
+        "text_encoder_target_name": "TEXT_ENCODER_TARGET_REPLACE_NAME",
+        "module_algo_map": "MODULE_ALGO_MAP",
+        "name_algo_map": "NAME_ALGO_MAP",
+        "use_fnmatch": "USE_FNMATCH",
+        "exclude_name": "TARGET_EXCLUDE_NAME",
+    }
     # Ignore proj_in or proj_out, their channels is only a few.
     ENABLE_CONV = True
     UNET_TARGET_REPLACE_MODULE = [
@@ -462,6 +473,7 @@ class LycorisNetworkKohya(LycorisNetwork):
         **kwargs,
     ) -> None:
         torch.nn.Module.__init__(self)
+        configure_preset(self, kwargs.pop("_preset", None), self._PRESET_FIELDS)
         root_kwargs = normalize_module_options(kwargs)
         dropout = float(dropout)
         rank_dropout = float(rank_dropout)
@@ -748,11 +760,11 @@ class LycorisNetworkKohya(LycorisNetwork):
         if network_module == GLoRAModule:
             logger.info("GLoRA enabled, only train transformer")
             # only train transformer (for GLoRA)
-            LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE = [
+            self.UNET_TARGET_REPLACE_MODULE = [
                 "Transformer2DModel",
                 "Attention",
             ]
-            LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME = []
+            self.UNET_TARGET_REPLACE_NAME = []
 
         self.text_encoder_loras = []
         te_matched_modules = set()
@@ -767,11 +779,10 @@ class LycorisNetworkKohya(LycorisNetwork):
 
             for i, te in enumerate(text_encoders):
                 loras, matched_mods, matched_nms = create_modules(
-                    LycorisNetworkKohya.LORA_PREFIX_TEXT_ENCODER
-                    + (f"{i + 1}" if use_index else ""),
+                    self.LORA_PREFIX_TEXT_ENCODER + (f"{i + 1}" if use_index else ""),
                     te,
-                    LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_MODULE,
-                    LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_NAME,
+                    self.TEXT_ENCODER_TARGET_REPLACE_MODULE,
+                    self.TEXT_ENCODER_TARGET_REPLACE_NAME,
                 )
                 self.text_encoder_loras.extend(loras)
                 te_matched_modules.update(matched_mods)
@@ -780,16 +791,16 @@ class LycorisNetworkKohya(LycorisNetwork):
                 f"create LyCORIS for Text Encoder: {len(self.text_encoder_loras)} modules."
             )
 
-        unet_target_modules = list(LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE)
+        unet_target_modules = list(self.UNET_TARGET_REPLACE_MODULE)
         if self.train_llm_adapter:
             unet_target_modules.append("LLMAdapterTransformerBlock")
             logger.info("Enable training for LLM Adapter (Anima)")
 
         self.unet_loras, unet_matched_modules, unet_matched_names = create_modules(
-            LycorisNetworkKohya.LORA_PREFIX_UNET,
+            self.LORA_PREFIX_UNET,
             unet,
             unet_target_modules,
-            LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME,
+            self.UNET_TARGET_REPLACE_NAME,
         )
         logger.info(f"create LyCORIS for U-Net: {len(self.unet_loras)} modules.")
 
@@ -800,12 +811,11 @@ class LycorisNetworkKohya(LycorisNetwork):
                 # Check text encoder targets
                 if text_encoder:
                     te_unmatched_modules = (
-                        set(LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_MODULE)
+                        set(self.TEXT_ENCODER_TARGET_REPLACE_MODULE)
                         - te_matched_modules
                     )
                     te_unmatched_names = (
-                        set(LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_NAME)
-                        - te_matched_names
+                        set(self.TEXT_ENCODER_TARGET_REPLACE_NAME) - te_matched_names
                     )
                     if te_unmatched_modules:
                         logger.warning(
@@ -821,8 +831,7 @@ class LycorisNetworkKohya(LycorisNetwork):
                 # Check unet targets
                 unet_unmatched_modules = set(unet_target_modules) - unet_matched_modules
                 unet_unmatched_names = (
-                    set(LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME)
-                    - unet_matched_names
+                    set(self.UNET_TARGET_REPLACE_NAME) - unet_matched_names
                 )
                 if unet_unmatched_modules:
                     logger.warning(

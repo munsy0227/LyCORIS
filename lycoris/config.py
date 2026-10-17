@@ -53,8 +53,36 @@ FULL_TEXT_ENCODER_MODULES = [
     "Qwen3MLP",  # Anima / Qwen3
 ]
 
+# Match original Transformer paths, not the generic private class name _Block.
+# These are LyCORIS scopes; OpenMOSS has not published LoRA target modules.
+MOSS_BLOCK_TARGETS = [r"^layers\.\d+\.proj\.(q|k|v|o|ffn_up_gate|ffn_down)$"]
+MOSS_FULL_TARGETS = MOSS_BLOCK_TARGETS + [
+    r"^text_embedder\.proj$",
+    r"^text_embedder\.blocks\.\d+\.(qkv|proj|ffn_gate|ffn_up|ffn_down)$",
+    r"^time_embedding\.(0|2)$",
+    r"^(video_embedder|shared_block_modulation|final_linear_video|video_head_modulation)$",
+]
+
+
+def _moss_preset(targets):
+    return PresetConfig(
+        enable_conv=False,
+        target_module=[],
+        target_name=list(targets),
+        unet_target_module=[],
+        unet_target_name=list(targets),
+        text_encoder_target_module=[],
+        text_encoder_target_name=[],
+        module_algo_map={},
+        name_algo_map={},
+        exclude_name=[],
+        use_fnmatch=False,
+    )
+
 
 BUILTIN_PRESET_CONFIGS = {
+    "moss": _moss_preset(MOSS_BLOCK_TARGETS),
+    "moss-full": _moss_preset(MOSS_FULL_TARGETS),
     "full": PresetConfig(
         enable_conv=True,
         unet_target_module=FULL_UNET_MODULES,

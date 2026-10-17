@@ -3,7 +3,6 @@ import os
 import fnmatch
 import math
 import re
-import logging
 
 from typing import Any
 
@@ -26,7 +25,7 @@ from .modules.base import is_supported_linear_module, is_weight_only_fp8_linear
 
 from .config import PRESET
 from .config_sdk import VALID_PRESET_KEYS
-from .utils.preset import read_preset
+from .utils.preset import configure_preset, read_preset
 from .utils import str_bool
 from .logging import logger
 
@@ -149,12 +148,12 @@ def create_lycoris(
     else:
         preset = PRESET[preset]
     assert preset is not None
-    LycorisNetwork.apply_preset(preset)
 
     logger.info(f"Using rank adaptation algo: {algo}")
 
     network = LycorisNetwork(
         module,
+        _preset=preset,
         multiplier=multiplier,
         lora_dim=linear_dim,
         conv_lora_dim=conv_dim,
@@ -195,6 +194,13 @@ def create_lycoris_from_weights(multiplier, file, module, weights_sd=None, **kwa
         else:
             weights_sd = torch.load(file, map_location="cpu")
 
+    preset = kwargs.get("preset")
+    if preset is not None:
+        preset = PRESET[preset] if preset in PRESET else read_preset(preset)
+        assert preset is not None
+    network = LycorisNetwork(module, init_only=True, _preset=preset)
+    network.multiplier = multiplier
+
     # get dim/alpha mapping
     loras = {}
     for key in weights_sd:
@@ -205,16 +211,9 @@ def create_lycoris_from_weights(multiplier, file, module, weights_sd=None, **kwa
         loras[lora_name] = None
 
     for name, modules in module.named_modules():
-        lora_name = f"{LycorisNetwork.LORA_PREFIX}_{name}".replace(".", "_")
+        lora_name = f"{network.LORA_PREFIX}_{name}".replace(".", "_")
         if lora_name in loras:
             loras[lora_name] = modules
-
-    original_level = logger.level
-    logger.setLevel(logging.ERROR)
-    network = LycorisNetwork(module, init_only=True)
-    network.multiplier = multiplier
-    network.loras = []
-    logger.setLevel(original_level)
 
     logger.info("Loading Modules from state dict...")
     for lora_name, orig_modules in loras.items():
@@ -236,6 +235,16 @@ def create_lycoris_from_weights(multiplier, file, module, weights_sd=None, **kwa
 
 
 class LycorisNetwork(torch.nn.Module):
+    _PRESET_FIELDS = {
+        "enable_conv": "ENABLE_CONV",
+        "target_module": "TARGET_REPLACE_MODULE",
+        "target_name": "TARGET_REPLACE_NAME",
+        "module_algo_map": "MODULE_ALGO_MAP",
+        "name_algo_map": "NAME_ALGO_MAP",
+        "lora_prefix": "LORA_PREFIX",
+        "use_fnmatch": "USE_FNMATCH",
+        "exclude_name": "TARGET_EXCLUDE_NAME",
+    }
     ENABLE_CONV = True
     TARGET_REPLACE_MODULE = [
         "Linear",
@@ -299,6 +308,7 @@ class LycorisNetwork(torch.nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
+        configure_preset(self, kwargs.pop("_preset", None), self._PRESET_FIELDS)
         root_kwargs = normalize_module_options(kwargs)
         dropout = float(dropout)
         rank_dropout = float(rank_dropout)
@@ -565,16 +575,16 @@ class LycorisNetwork(torch.nn.Module):
         target_modules = list(
             set(
                 [
-                    *LycorisNetwork.TARGET_REPLACE_MODULE,
-                    *LycorisNetwork.MODULE_ALGO_MAP.keys(),
+                    *self.TARGET_REPLACE_MODULE,
+                    *self.MODULE_ALGO_MAP.keys(),
                 ]
             )
         )
         target_names = list(
             set(
                 [
-                    *LycorisNetwork.TARGET_REPLACE_NAME,
-                    *LycorisNetwork.NAME_ALGO_MAP.keys(),
+                    *self.TARGET_REPLACE_NAME,
+                    *self.NAME_ALGO_MAP.keys(),
                 ]
             )
         )
@@ -584,11 +594,11 @@ class LycorisNetwork(torch.nn.Module):
                 target_modules.remove("LLMAdapterTransformerBlock")
 
         self.loras, matched_modules, matched_names = create_modules(
-            LycorisNetwork.LORA_PREFIX,
+            self.LORA_PREFIX,
             module,
             target_modules,
             target_names,
-            target_exclude_names=LycorisNetwork.TARGET_EXCLUDE_NAME,
+            target_exclude_names=self.TARGET_EXCLUDE_NAME,
         )
         logger.info(f"create LyCORIS: {len(self.loras)} modules.")
 

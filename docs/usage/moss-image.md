@@ -1,6 +1,7 @@
 # MOSS-Image adapters
 
-LyCORIS supports the local `MOSSImageTransformer` through `create_lycoris` and
+LyCORIS supports the local `MOSSImageTransformer` and official sd-scripts
+`MossImage` through `create_lycoris` and
 the Kohya-compatible `create_network` API. This provides adapter construction,
 training integration, save/load, and merge operations. It does not add a MOSS
 dataset trainer to sd-scripts or a ComfyUI loader.
@@ -28,6 +29,24 @@ recommends keeping the text encoder frozen but does not specify LoRA target
 layers. Neither preset is claimed to reproduce an official LoRA configuration.
 
 ## Local loading and training integration
+
+The local sd-scripts fork integrates official `dev` through `6a3290182c`, including
+the stage 3 network trainer at `cb5c24fc72`. Its `moss_train_network.py` is now
+a compatibility subclass of `moss_image_train_network.py`, using the official DiT, text-only Qwen3.5, FLUX.2 VAE,
+and caching strategies while keeping TXT/JSON/layout conditioning and both
+LyCORIS presets. See the fork's `docs/moss_train_network.md` for folder, shard,
+and floating-point ComfyUI file inputs. The official `MossImage` keeps the same
+adapter paths and returns a Tensor directly; the original pipeline model below
+returns an object with `.sample`. The following original-pipeline example remains
+an alternative for applications that already use that model.
+
+The official generic default matches `moss` at 252 targets, but its optional
+`train_text_embedder=true` has 263 targets and differs from `moss-full` at 269.
+Keep the LyCORIS module and presets for full-matrix LoKR+DoRA and existing
+native checkpoint restoration. The old command retains discrete uniform
+timestep sampling; the official entry defaults to sigmoid sampling. Qwen is
+frozen by default, and cached prompt tensors are moved to the CPU before the
+DiT is loaded. Qwen encoding uses BF16 weights with FP32 rotary buffers.
 
 Use a separate environment with LyCORIS, PyTorch, and the dependencies required
 by the model's local `pipeline_moss_image.py`. The published MOSS requirements
@@ -171,6 +190,11 @@ shared output-axis DoRA direction norm. These integrations are separate from
 LyCORIS installation; install the local forks to use them.
 
 ## Validation
+
+`test/test_moss_sd_scripts.py` additionally checks both factories with the
+official sd-scripts model, the 252/269 production scopes, and LoRA/full-matrix
+LoKR/LoKR+DoRA backward on CPU FP32 and CUDA BF16 when available. Add the local
+sd-scripts checkout to `PYTHONPATH` to run this optional integration.
 
 The standard tests use a small structural model with all 269 production module
 paths. Optional integration tests read the real checkpoint headers and import

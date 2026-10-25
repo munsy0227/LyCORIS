@@ -1810,23 +1810,12 @@ class LokrModule(LycorisBaseModule):
         magnitude_shape = tuple(magnitude.shape)
         output_shape = (direction.shape[0], *[1] * (direction.dim() - 1))
         input_shape = (1, direction.shape[1], *[1] * (direction.dim() - 2))
+        scaled_direction = direction
 
         if magnitude_shape == output_shape:
             norm_dims = tuple(range(1, direction.dim()))
-            direction_norm = torch.linalg.vector_norm(
-                direction,
-                dim=norm_dims,
-                keepdim=True,
-            )
-            scaled_direction = direction
         elif magnitude_shape == input_shape:
             norm_dims = (0, *range(2, direction.dim()))
-            direction_norm = torch.linalg.vector_norm(
-                direction,
-                dim=norm_dims,
-                keepdim=True,
-            )
-            scaled_direction = direction
         elif len(magnitude_shape) == direction.dim() + 1:
             groups = magnitude_shape[0]
             if (
@@ -1847,21 +1836,16 @@ class LokrModule(LycorisBaseModule):
             )
             scaled_direction = direction.reshape(grouped_shape)
             norm_dims = (1, *range(3, scaled_direction.dim()))
-            direction_norm = torch.linalg.vector_norm(
-                scaled_direction,
-                dim=norm_dims,
-                keepdim=True,
-            )
         else:
             raise ValueError(
                 "Cannot infer the DoRA norm axis from dora_scale: "
                 f"weight={tuple(direction.shape)}, dora_scale={magnitude_shape}."
             )
 
-        # DoRA treats the direction norm as a constant during backpropagation.
-        direction_norm = direction_norm.clamp_min(
-            torch.finfo(direction.dtype).tiny
-        ).detach()
+        # Detach before the reduction so autograd never saves a full norm input.
+        direction_norm = torch.linalg.vector_norm(
+            scaled_direction.detach(), dim=norm_dims, keepdim=True
+        ).clamp_min(torch.finfo(direction.dtype).tiny)
         dora_weight = (scaled_direction * (magnitude / direction_norm)).reshape_as(
             direction
         )
@@ -2110,7 +2094,31 @@ class LokrModule(LycorisBaseModule):
         delta = self.bypass_forward_diff(x, scale=scale)
         return base + delta.to(base)
 
+    def _rebuild_forward(self, x, base, base_weight):
+        new_weight = self._calculate_merged_weight(
+            base_weight, self.multiplier, self.shape
+        )
+        delta_weight = (new_weight - base_weight.to(new_weight)).to(dtype=x.dtype)
+        delta = self._weight_forward(x, delta_weight, None)
+        return new_weight, base + self.drop(delta).to(dtype=base.dtype)
+
     def forward(self, x: torch.Tensor, *args, **kwargs):
+        # A lone wrapper needs no shared weight state, so compile can fuse DoRA.
+        wrappers = getattr(self.org_module[0], "_lycoris_wrappers", ())
+        if len(wrappers) == 1 and wrappers[0] is self:
+            if self.module_dropout and self.training:
+                if torch.rand(1) < self.module_dropout:
+                    return self.org_forward(x, *args, **kwargs)
+            base = self.org_forward(x, *args, **kwargs)
+            if self.bypass_mode and not (
+                self.wd and is_weight_only_fp8_linear(self.org_module[0])
+            ):
+                delta = self.bypass_forward_diff(x, scale=self.multiplier)
+                return base + delta.to(base)
+            return self._rebuild_forward(x, base, self._current_weight().to(x.device))[
+                1
+            ]
+
         forward_weights = _lokr_forward_weights.get()
         context_token = None
         if forward_weights is None:
@@ -2140,31 +2148,16 @@ class LokrModule(LycorisBaseModule):
                 if context_token is None:
                     base = self.org_forward(x, *args, **kwargs)
                     base_weight = current_forward_weight().to(x.device)
-                    new_weight = self._calculate_merged_weight(
-                        base_weight,
-                        self.multiplier,
-                        self.shape,
-                    )
+                    new_weight, output = self._rebuild_forward(x, base, base_weight)
                     forward_weights[module_key] = new_weight
-                    delta_weight = (new_weight - base_weight.to(new_weight)).to(
-                        dtype=x.dtype
-                    )
-                    delta = self._weight_forward(x, delta_weight, None)
-                    return base + self.drop(delta).to(dtype=base.dtype)
+                    return output
                 return self.bypass_forward(x, self.multiplier, *args, **kwargs)
 
             base = self.org_forward(x, *args, **kwargs)
             base_weight = current_forward_weight().to(x.device)
-            new_weight = self._calculate_merged_weight(
-                base_weight,
-                self.multiplier,
-                self.shape,
-            )
+            new_weight, output = self._rebuild_forward(x, base, base_weight)
             forward_weights[module_key] = new_weight
-
-            delta_weight = (new_weight - base_weight.to(new_weight)).to(dtype=x.dtype)
-            delta = self._weight_forward(x, delta_weight, None)
-            return base + self.drop(delta).to(dtype=base.dtype)
+            return output
         finally:
             if context_token is not None:
                 _lokr_forward_weights.reset(context_token)

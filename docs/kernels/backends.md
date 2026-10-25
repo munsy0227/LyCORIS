@@ -11,12 +11,18 @@ Per call, in this order, first one that applies wins:
    process.
 4. **torch** — the stock eager implementation.
 
+The order is per device. Triton issues tensor-core dots only from sm_80, so on
+sm_70 / sm_75 TileLang (which emits the Volta / Turing MMA instructions) comes
+first and Triton is used there only when named explicitly.
+
 A call steps one tier down when the operands or the layout are outside a
-fused kernel's scope: CPU tensors, fp16 mixed with bf16 in the same call, a
-conv layout where the kernel is written for the linear one, a rank past the
-kernel's register budget, or a scale that carries a gradient. The tier below
-covers everything the tier above does, so the fallback is always defined —
-there is no configuration in which a call fails for lack of a kernel.
+fused kernel's scope: CPU tensors, fp16 mixed with bf16 in the same call, bf16
+on a device without bf16 MMA (sm_70 / sm_75), a conv layout where the kernel
+is written for the linear one, a rank past the kernel's register budget, or a
+scale that carries a gradient. The tier below covers everything the tier above
+does, so the fallback is always defined — there is no configuration in which a
+call fails for lack of a kernel. A backend that imports but fails to run is
+dropped for that device only.
 
 The compile tier is used **on CUDA only** unless you name it explicitly: the
 CPU callers here are weight merges, where an inductor warmup costs more than
@@ -27,8 +33,8 @@ the operation it replaces.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `LYCORIS_KERNEL_BACKEND` | `auto` | `auto`, `triton`, `tilelang`, `compile` or `torch`. A named backend is still narrowed per call by the scope rules above. |
-| `LYCORIS_KERNEL_TUNE` | `on` | `off` skips the measured tile pick and takes the planner's first candidate. |
-| `LYCORIS_KERNEL_CACHE_DIR` | `~/.cache/lycoris_kernels` | Where the tuning table (`tuning.json`) lives. |
+| `LYCORIS_KERNEL_TUNE` | `on` | `off` skips the measured tile pick and takes the planner's first candidate. `set_tuning` overrides it in-process. |
+| `LYCORIS_KERNEL_CACHE_DIR` | `~/.cache/lycoris_kernels` | Where the tuning tables (`tuning.json`, `kernels/<arch>-<card>.json`) live. |
 
 ## From Python
 
@@ -37,8 +43,25 @@ from lycoris.kernels import available_backends, fused_backends, resolve_backend
 
 available_backends()   # ('triton', 'tilelang', 'compile', 'torch')
 fused_backends()       # ('triton', 'tilelang')  -- the ones with an op set
-resolve_backend()      # 'triton'  -- process-wide preference
+resolve_backend()      # 'triton'  -- preference; pass a device for its own order
 ```
+
+Config timing is switched per process with `set_tuning`:
+
+```python
+from lycoris.kernels import set_tuning, tuning_enabled
+
+prev = set_tuning(False)   # time nothing; returns the previous setting (None)
+tuning_enabled()           # False
+set_tuning(prev)           # restore; None follows LYCORIS_KERNEL_TUNE again
+```
+
+`set_tuning(True)` / `set_tuning(False)` take precedence over
+`LYCORIS_KERNEL_TUNE`; `set_tuning(None)` (the initial state) reads the
+variable on each lookup. With timing off, a key without a stored config runs
+the planner's first config, kept for the process and never stored; once timing
+is on again, that key is timed on its next call. Stored configs are used
+either way.
 
 The per-call decision is `lycoris.kernels.select.choose(tensors, supported)`;
 `supported` is the caller's own layout test. Every functional entry point and
@@ -52,7 +75,8 @@ The kernels are not `triton.autotune`d. Each op has an analytic cost model in
 device — SM count, L2 size, measured DRAM bandwidth and matmul peak, whether
 `cp.async` is available (sm_80+, which sets the usable pipeline depths) — and
 returns a shortlist of the best five to seven. The shortlist is timed once,
-best of three rounds, and the winner is cached in memory and in
+best of three rounds (the pick is kept for the life of the table, so one noisy
+pass would keep a slower plan), and the winner is cached in memory and in
 `tuning.json`, keyed by device name, op, bucketed shape and dtype. A later
 process reuses the table and pays nothing.
 
@@ -60,6 +84,11 @@ process reuses the table and pays nothing.
 the eager formulation at some shape, the tuner picks eager for that shape and
 records it. Being slower than PyTorch at a shape is therefore a measurement,
 not a regression you have to hit in production.
+
+The per-family `stream`, `rebuild`, `hada`, `regen`, `apply`, `grad`, `kron`,
+`decompose`, `channel`, `rotate` and `stages` kernels rank their configs with
+the device-measured cost model of `lycoris/kernels/tuner/` and time a short
+shortlist instead; see [tuning.md](tuning.md).
 
 ## Adding a backend
 

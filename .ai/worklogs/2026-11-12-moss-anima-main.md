@@ -26,7 +26,19 @@
 - RTX 4070에서 `test.test_lokr_cuda`, `test.test_moss_sd_scripts`: **6 passed, 0 skipped**, 51.011초. FP32/FP16/BF16 DoRA 수학·gradient, compiled checkpoint, 정확한 merge/undo, mock Anima 448개 BF16 optimizer step 및 공식 sd-scripts MOSS 양 factory 연동과 252/269 범위를 확인했다.
 - 두 저장소의 실제 통합 worktree를 `PYTHONPATH`에 함께 지정했다. CPU에서는 `CUDA_VISIBLE_DEVICES=''`로 GPU 실행을 차단했고 CUDA 검사는 별도로 실행했다.
 - 로그: `/tmp/lycoris-moss-anima-cpu-20261112.log`, `/tmp/lycoris-moss-anima-cuda-20261112.log`.
+- 공동 통합 검증에서 sd-scripts Anima 448개 어댑터의 BF16 학습·native state 파일 저장/복원도 gradient checkpointing off/on 두 경우 모두 통과했다.
 - 이 단계에서 main ref와 원격 브랜치는 변경하지 않았다.
+
+## CI 대응 검사
+
+- 별도 `/tmp` 검증 환경에만 Black 26.10.1, Ruff 0.17.4, build 1.6.1과 wheel을 설치했다.
+- `black --check --no-cache --workers 1 lycoris/ scripts/ test/`: **186개 파일 모두 변경 불필요**. 샌드박스 process pool 대기를 피하도록 host에서 단일 worker로 실행했다.
+- `ruff check lycoris/ scripts/ test/`: **전체 통과**.
+- `scripts/ci/import_check.py`: **101/101 modules import cleanly, 34 skipped**. 선택 backend 미설치에 따른 skip이다.
+- `scripts/ci/cpu_smoke.py`: **0 failures**. import와 smoke 검사 모두 `CUDA_VISIBLE_DEVICES=''`를 적용했다.
+- `python -m build --no-isolation`: **sdist와 wheel 빌드 성공**. 결과는 `/tmp/lycoris-moss-anima-package-20261112/`에 보관했다.
+- wheel을 별도 `/tmp/lycoris-moss-anima-wheel-installed-20261112` target에 설치하고 해당 경로에서 import했음을 assert한 뒤 `available_backends()`를 확인했다. 의존성은 별도 검증 환경을 재사용했다.
+- 검사 로그는 `/tmp/lycoris-moss-anima-{black-host,ruff,import,smoke,build,wheel-import}-20261112.log`에 보관했다.
 
 ## 보존 기준과 제한
 

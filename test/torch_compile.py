@@ -11,6 +11,7 @@ from lycoris.functional.lokr import (
     weight_gen,
 )
 from lycoris.kernels.select import choose, compiled
+from lycoris.modules import LokrModule
 
 
 class TorchCompileCompatibility(unittest.TestCase):
@@ -28,6 +29,39 @@ class TorchCompileCompatibility(unittest.TestCase):
         x = torch.randn(2)
         actual = torch.compile(fn, backend="eager", fullgraph=True)(x)
         torch.testing.assert_close(actual, x + 1)
+
+    def test_outer_compile_captures_single_lokr_dora_forward_and_gradients(self):
+        for output_axis in (True, False):
+            with self.subTest(output_axis=output_axis):
+                torch.manual_seed(24)
+                base = torch.nn.Linear(16, 24, dtype=torch.float64)
+                base.requires_grad_(False)
+                adapter = LokrModule(
+                    "compiled",
+                    base,
+                    lora_dim=100000,
+                    factor=4,
+                    full_matrix=True,
+                    weight_decompose=True,
+                    use_scalar=True,
+                    wd_on_out=output_axis,
+                    multiplier=0.3,
+                ).double()
+                with torch.no_grad():
+                    adapter.lokr_w2.normal_(std=0.02)
+                    adapter.scalar.fill_(0.4)
+                adapter.apply_to()
+                x = torch.randn(2, 3, 16, dtype=torch.float64, requires_grad=True)
+                leaves = (x, *adapter.parameters())
+                expected = base(x)
+                actual = torch.compile(base, backend="eager", fullgraph=True)(x)
+                torch.testing.assert_close(actual, expected)
+                grad = torch.randn_like(expected)
+                for got, wanted in zip(
+                    torch.autograd.grad(actual, leaves, grad),
+                    torch.autograd.grad(expected, leaves, grad),
+                ):
+                    torch.testing.assert_close(got, wanted)
 
     def test_outer_compile_preserves_full_matrix_zero_alpha(self):
         x = torch.randn(2, 6, dtype=torch.float64, requires_grad=True)

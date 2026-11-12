@@ -1809,6 +1809,27 @@ class LokrConsistencyTests(unittest.TestCase):
         )
         torch.testing.assert_close(direction.grad, expected_gradient)
 
+    def test_dora_norm_does_not_save_a_second_full_direction(self):
+        base = nn.Linear(8, 12, bias=False)
+        for output_axis in (True, False):
+            with self.subTest(output_axis=output_axis):
+                module = self._make_full_matrix_dora(base, wd_on_out=output_axis)
+                direction = torch.randn_like(base.weight, requires_grad=True)
+                saved_shapes = []
+
+                def pack(tensor):
+                    saved_shapes.append(tensor.shape)
+                    return tensor
+
+                with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+                    output = module.apply_weight_decompose(
+                        direction, multiplier=0.3, base_weight=base.weight.detach()
+                    )
+                # Only the magnitude gradient needs the full direction.
+                self.assertEqual(saved_shapes.count(direction.shape), 1)
+                output.sum().backward()
+                self.assertTrue(torch.isfinite(direction.grad).all())
+
     def test_full_matrix_uses_unit_scale_with_rs_lora(self):
         base = nn.Linear(8, 8)
         module = self._make_full_matrix_dora(base, rs_lora=True)

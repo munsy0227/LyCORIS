@@ -35,6 +35,69 @@ def reference(module, multiplier):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class CudaDora(unittest.TestCase):
+    def test_compiled_checkpoint_matches_dora_reference_gradients(self):
+        from torch.utils.checkpoint import checkpoint
+
+        for dtype, axis in product(
+            (torch.float32, torch.float16, torch.bfloat16), (True, False)
+        ):
+            with self.subTest(dtype=dtype, output_axis=axis):
+                torch.manual_seed(61)
+                base = nn.Linear(16, 24, bias=False, device="cuda", dtype=dtype)
+                base.requires_grad_(False)
+                adapter = LokrModule(
+                    "compiled",
+                    base,
+                    lora_dim=100000,
+                    factor=4,
+                    full_matrix=True,
+                    weight_decompose=True,
+                    use_scalar=True,
+                    wd_on_out=axis,
+                    multiplier=0.3,
+                ).cuda()
+                with torch.no_grad():
+                    adapter.lokr_w2.normal_(std=0.02)
+                    adapter.scalar.fill_(0.4)
+                adapter.apply_to()
+                x = torch.randn(
+                    2, 3, 16, device="cuda", dtype=dtype, requires_grad=True
+                )
+
+                def forward(x):
+                    with torch.autocast(
+                        "cuda", dtype=dtype, enabled=dtype != torch.float32
+                    ):
+                        return checkpoint(base, x, use_reentrant=False)
+
+                with torch.autocast(
+                    "cuda", dtype=dtype, enabled=dtype != torch.float32
+                ):
+                    delta = (reference(adapter, 0.3) - base.weight.float()).to(dtype)
+                    expected = torch.nn.functional.linear(
+                        x, base.weight
+                    ) + torch.nn.functional.linear(x, delta)
+                actual = torch.compile(forward, fullgraph=True)(x)
+                tolerance = {
+                    torch.float32: (1e-4, 1e-5),
+                    torch.float16: (2e-2, 1e-3),
+                    torch.bfloat16: (5e-2, 2e-3),
+                }[dtype]
+                torch.testing.assert_close(
+                    actual, expected, rtol=tolerance[0], atol=tolerance[1]
+                )
+                leaves = (x, *adapter.parameters())
+                grad = torch.randn_like(actual)
+                for got, wanted in zip(
+                    torch.autograd.grad(actual, leaves, grad),
+                    torch.autograd.grad(expected, leaves, grad),
+                ):
+                    self.assertTrue(torch.isfinite(got).all())
+                    torch.testing.assert_close(
+                        got, wanted, rtol=tolerance[0], atol=tolerance[1]
+                    )
+                torch._dynamo.reset()
+
     def test_full_matrix_dora_math_grad_checkpoint_and_undo(self):
         cases = list(
             product(

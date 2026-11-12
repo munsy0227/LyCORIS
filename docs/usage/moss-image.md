@@ -170,6 +170,39 @@ names, including separate Q/K/V adapters on fused QKV weights, and corrects the
 shared output-axis DoRA direction norm. These integrations are separate from
 LyCORIS installation; install the local forks to use them.
 
+## Training performance
+
+The sd-scripts MOSS trainer supports per-block compilation. With one LoKR
+adapter per target, LyCORIS skips stack-only shared state so the compiler can
+fuse FP32 DoRA reconstruction, normalization and residual operations. Multiple
+wrappers retain their ordered composition path. Detached norm inputs also avoid
+saving a redundant full weight tensor for backward.
+
+Enable the existing trainer option in the training TOML:
+
+```toml
+compile = true
+```
+
+Use the default compile mode first. Compilation adds startup time and may
+repeat for different resolution/text-length buckets; compare warmed-up steps.
+For MOSS with text masks, use the matching sd-scripts attention update that
+resolves uniform sequence lengths before the compiled blocks. Block swapping
+excludes Linear layers from compilation, limiting this optimization.
+The matching MOSS trainer also enables Inductor's `emulate_precision_casts` to
+preserve intermediate BF16 rounding while retaining the selected mode's preset.
+
+An RTX 4070 test of one production-sized block (5440 tokens, BF16,
+full-matrix LoKR+DoRA, gradient checkpointing, text mask) decreased repeated
+forward/backward time from about 303 ms to 193 ms and peak allocated GPU memory
+from 3248 MiB to 1745 MiB. This is a synthetic block measurement, excluding the
+optimizer/data loading; it does not establish full-model or RTX 5090 speed.
+Compilation preserves parameter precision but may change operation ordering.
+The trainer also retains BF16 text caches without an FP32 intermediate, batches
+Prodigy CUDA statistics and updates, and avoids unnecessary input gradients for
+ordinary non-reentrant checkpointing. See its performance guide for the scope
+and fallback behavior of those changes.
+
 ## Validation
 
 The standard tests use a small structural model with all 269 production module
